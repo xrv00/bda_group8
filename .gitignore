@@ -48,3 +48,10 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Project data
+data/raw/*
+!data/raw/.gitkeep
+*.sqlite
+*.db
+*.rds
