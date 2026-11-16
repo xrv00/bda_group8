@@ -54,8 +54,10 @@ Alternatively, if you use Git: `git clone https://github.com/xrv00/bda_group8.gi
 **Raw data (Kaggle):**
 "500K+ Spotify Songs with Lyrics, Emotions & More"
 <(https://www.kaggle.com/datasets/devdope/900k-spotify)>
+
 Download it with the script `R/01_ingest.R`, or manually from the link above, and place the file in `data/raw/`.
 A free Kaggle account and API token (`kaggle.json`) are needed for the scripted download.
+
 **Processed data (Google Drive):**
 link to the data files: 
 <(https://drive.google.com/drive/folders/1URD0xl4ZbSFGnHpN5ruMKUgx-iZquKyl?usp=drive_link)>
