@@ -65,6 +65,19 @@ link to the data files:
 - `stage2_features/` (6 train/test parquet files) goes into `data/processed/`
 If you run the scripts from the start, you do not need the Drive files, because they are regenerated.
 
+## Outputs
+| File | Location | Produced by |
+|---|---|---|
+| spotify_clean.parquet, spotify_structured.sqlite | data/processed/ (Drive) | Data Engineer |
+| Ingestion log, data dictionary | report/ | Data Engineer |
+| audio, lyrics, combined train/test parquet files (6) | data/processed/ (Drive) | Feature Engineer |
+| predictions_naive_bayes.csv | outputs/ | Feature Engineer |
+| predictions_logistic_regression.csv | outputs/ | Data Scientist |
+| predictions_random_forest.csv | outputs/ | Integration Lead |
+| plot1 to plot3, plot6 | outputs/ | Data Scientist |
+| plot4_confusion.png, plot5_macro_f1.png | outputs/ | Integration Lead |
+| dashboard.Rmd, final_dashboard.html | report/ | Data Scientist |
+
 ## How to Run
 Run from the project root, in this order:
 1. `R/01_ingest.R`
