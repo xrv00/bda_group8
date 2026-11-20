@@ -1,98 +1,118 @@
 # 02_features.R
 # Owner: Tam Yi Qing (Spark Feature Engineer)
 # Purpose: Train/test split, TF-IDF, audio, lyrics and combined feature sets
+# AI-assisted (Claude), 20 Nov 2026
+# =====================================================================
+# Steps
+#   1  connect Spark
+#   2  base table (dup_flag = 0, valid emotion)
+#   3  clean lyrics
+#   4  remove duplicate lyrics
+#   5  80/20 split by artist
+#   6  tokenise, remove stop words (keep negations)
+#   7  check no duplicate lyrics left
+#   8  min-max scaling (train only)
+#   9  TF-IDF (train only)
+#   10 feature vectors, class weights
+#   11 write six parquet files
+#
+# Feature sets
+#   audio_*    = 9 scaled audio values
+#   lyrics_*   = TF-IDF vector
+#   combined_* = 9 audio + mean_similarity + TF-IDF
+# =====================================================================
 
 # ---------------------------------------------------------------------
-# 0. SWITCHES AND SETTINGS 
+# 0. SETTINGS
 # ---------------------------------------------------------------------
-PILOT        <- FALSE      # TRUE = 5% of artists, separate folder, scores not reported
+PILOT        <- FALSE    # TRUE = quick test with 5% of artists
 PILOT_FRAC   <- 0.05
-SPARK_VERSION <- "3.5.1"
-DRIVER_MEM   <- "8G"      # if Spark stalls, use "6G"
-CORES        <- 4         # if Spark stalls, use 2
+SPOT_CHECK   <- PILOT    # TRUE = show what each tag rule removes
+PREFERRED_SPARK <- "3.5.1"   # falls back to newest installed
+DRIVER_MEM   <- "8G"     # memory for Spark
+CORES        <- 4        # CPU cores for Spark
 
-BDA_DIR   <- "C:/Users/USER/OneDrive - ums.edu.my/Desktop/BDA/BDA"
-IN_PATH   <- file.path(BDA_DIR, "data", "spotify_clean.parquet")
-WORK_ROOT <- "C:/BDA_work"
-OUT_DIR   <- if (PILOT) file.path(WORK_ROOT, "pilot") else WORK_ROOT
-TMP_DIR   <- file.path(OUT_DIR, "_tmp")
+# Project root = working directory (or its parent if you are inside R/)
+PROJECT_ROOT <- normalizePath(getwd(), winslash = "/")
+if (basename(PROJECT_ROOT) == "R") PROJECT_ROOT <- dirname(PROJECT_ROOT)
+PROC_DIR     <- file.path(PROJECT_ROOT, "data", "processed")
 
-SALTS     <- c("bda_stage2_v1", "bda_stage2_v2")  # second is used only if the first fails the check
+# Input file from 01_ingest.R
+IN_CANDIDATES <- c(file.path(PROJECT_ROOT, "data", "clean", "spotify_clean.parquet"),
+                   Sys.glob(file.path(PROJECT_ROOT, "data", "clean", "spotify_clean_*.parquet")),
+                   file.path(PROJECT_ROOT, "data", "spotify_clean.parquet"),
+                   file.path(PROC_DIR, "spotify_clean.parquet"))
+IN_FOUND    <- IN_CANDIDATES[file.exists(IN_CANDIDATES)]
+IN_PATH     <- if (length(IN_FOUND)) IN_FOUND[which.max(file.mtime(IN_FOUND))] else IN_CANDIDATES[1]
+FEATURE_DIR <- if (PILOT) file.path(PROC_DIR, "pilot") else PROC_DIR
+RES_DIR     <- if (PILOT) file.path(PROJECT_ROOT, "outputs", "stage2", "pilot") else
+  file.path(PROJECT_ROOT, "outputs", "stage2")
+
+# Spark temp folder (set BDA_WORK_ROOT to change)
+WORK_ROOT <- Sys.getenv("BDA_WORK_ROOT",
+                        unset = if (.Platform$OS.type == "windows") "C:/BDA_work"
+                        else file.path(path.expand("~"), "BDA_work"))
+WORK_DIR  <- if (PILOT) file.path(WORK_ROOT, "pilot") else WORK_ROOT
+TMP_DIR   <- file.path(WORK_DIR, "_tmp")
+
+SALTS     <- c("bda_stage2_v1", "bda_stage2_v2")  # second salt used only if the first fails
 TRAIN_PCT <- 80
-TOL_PTS   <- 0.5          # class-share tolerance in percentage points
+TOL_PTS   <- 0.5          # class-share tolerance (percentage points)
 VOCAB_SIZE <- 10000
 MIN_DF     <- 5
-USE_HASHING_FALLBACK <- FALSE   # TRUE = HashingTF with 4096 features if memory fails
+USE_HASHING_FALLBACK <- FALSE   # TRUE = HashingTF if memory fails
 HASH_FEATURES <- 4096
-EXPECTED_BASE <- 493820   # Harvey's model_ready view
+
+# expected rows with use_for_model = 1 (NA = skip)
+EXPECTED_MODEL_READY <- NA_real_
+
+# TRUE = also remove lyrics identical after cleaning
+REMOVE_CLEANED_DUPS <- TRUE
 
 AUDIO9 <- c("energy", "valence", "danceability", "tempo", "loudness",
             "speechiness", "liveness", "acousticness", "instrumentalness")
-CLASSES <- c("anger", "fear", "joy", "love", "sadness", "surprise")  # label 0..5
+CLASSES <- c("anger", "fear", "joy", "love", "sadness", "surprise")  # labels 0..5
 
 # ---------------------------------------------------------------------
-# 1. PACKAGES, LOGGING, ENVIRONMENT CHECK
+# 1. PACKAGES, LOGGING, SPARK CONNECTION
 # ---------------------------------------------------------------------
 pk <- c("sparklyr", "dplyr", "readr")
 miss <- pk[!pk %in% rownames(installed.packages())]
 if (length(miss)) install.packages(miss)
 suppressPackageStartupMessages({ library(sparklyr); library(dplyr) })
 
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
-dir.create(TMP_DIR, recursive = TRUE, showWarnings = FALSE)
-LOG <- file.path(OUT_DIR, "stage2_log.txt")
+for (d in c(FEATURE_DIR, RES_DIR, WORK_DIR, TMP_DIR)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+LOG <- file.path(RES_DIR, "stage2_log.txt")
 if (file.exists(LOG)) file.remove(LOG)
 say  <- function(...) { m <- paste0(...); cat(m, "\n"); cat(m, "\n", file = LOG, append = TRUE) }
 hdr  <- function(t) say("\n==== ", t, " ====")
 say_df <- function(d) for (l in capture.output(print(as.data.frame(d), row.names = FALSE))) say(l)
-reg <- function(x, name) invisible(sdf_register(x, name))   # register a Spark view quietly
+reg <- function(x, name) invisible(sdf_register(x, name))   # register a Spark view
 T0 <- Sys.time()
 
-hdr("STEP 1: environment")
-say("Script version 3 (new bracket rule, lyric dedup before split, 9 audio features)")
+hdr("STEP 1: Spark connection")
 say("Run mode: ", if (PILOT) "PILOT (5% of artists)" else "FULL")
 say("Started : ", format(T0))
+say("Project root : ", PROJECT_ROOT)
+say("Input        : ", IN_PATH)
+say("Spark work   : ", WORK_DIR)
 
-jv <- tryCatch(system2("java", "-version", stdout = TRUE, stderr = TRUE), error = function(e) NULL)
-if (is.null(jv)) stop("Java was not found on PATH. Install Temurin 17 and restart R.")
-m <- regmatches(jv[1], regexec('version "([0-9]+)\\.?([0-9]*)', jv[1]))[[1]]
-java_major <- as.integer(m[2]); if (java_major == 1L) java_major <- as.integer(m[3])
-say("Java major version: ", java_major)
-if (!java_major %in% c(8L, 11L, 17L))
-  stop("Spark 3.5 needs Java 8, 11 or 17. Found Java ", java_major, ".")
-
-if (Sys.getenv("JAVA_HOME") == "") {            # only set it if it clearly points to a real JDK
-  jp <- Sys.which("java")
-  if (nzchar(jp)) {
-    cand <- dirname(dirname(normalizePath(jp, winslash = "/")))
-    if (file.exists(file.path(cand, "release"))) {
-      Sys.setenv(JAVA_HOME = cand); say("JAVA_HOME set to ", cand)
-    }
-  }
-}
-
-inst <- spark_installed_versions()$spark
-if (!SPARK_VERSION %in% inst)
-  stop("Spark ", SPARK_VERSION, " is not installed. Installed: ", paste(inst, collapse = ", "),
-       ". Run spark_install('", SPARK_VERSION, "') or change SPARK_VERSION.")
-say("Spark ", SPARK_VERSION, " found.")
-
-# Windows needs winutils.exe + hadoop.dll, otherwise Spark fails with
-# "UnsatisfiedLinkError ... NativeIO$Windows.access0" when it reads or writes files.
+# Windows: point Spark to the Hadoop files if they exist
 if (.Platform$OS.type == "windows") {
   hh <- Sys.getenv("HADOOP_HOME")
-  if (hh == "" && file.exists("C:/hadoop/bin/winutils.exe")) { hh <- "C:/hadoop"; Sys.setenv(HADOOP_HOME = hh) }
-  has_files <- hh != "" && file.exists(file.path(hh, "bin", "winutils.exe")) &&
-    file.exists(file.path(hh, "bin", "hadoop.dll"))
-  if (!has_files)
-    stop("winutils.exe and/or hadoop.dll not found (HADOOP_HOME = '", hh, "'). ",
-         "Put both files in C:/hadoop/bin, then restart R (Session > Restart R) and rerun.")
-  Sys.setenv(PATH = paste(normalizePath(file.path(hh, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
-  say("HADOOP_HOME = ", hh, " (winutils.exe and hadoop.dll found)")
+  if (hh == "" && dir.exists("C:/hadoop/bin")) { hh <- "C:/hadoop"; Sys.setenv(HADOOP_HOME = hh) }
+  if (hh != "") Sys.setenv(PATH = paste(normalizePath(file.path(hh, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
 }
 
-if (!file.exists(IN_PATH)) stop("Input not found: ", IN_PATH)
+if (!file.exists(IN_PATH))
+  stop("Input not found. Looked in: ", paste(IN_CANDIDATES, collapse = " | "),
+       "\nRun R/01_ingest.R first.")
 
+inst <- tryCatch(spark_installed_versions()$spark, error = function(e) character(0))
+SPARK_VERSION <- if (PREFERRED_SPARK %in% inst) PREFERRED_SPARK else
+  if (length(inst)) tail(sort(inst), 1) else PREFERRED_SPARK
+
+tryCatch(spark_disconnect_all(), error = function(e) NULL)   # close old connections
 cfg <- spark_config()
 cfg$`sparklyr.shell.driver-memory` <- DRIVER_MEM
 cfg$sparklyr.cores.local           <- CORES
@@ -100,11 +120,11 @@ cfg$spark.sql.shuffle.partitions   <- 32
 cfg$spark.local.dir                <- file.path(WORK_ROOT, "spark_tmp")
 dir.create(cfg$spark.local.dir, recursive = TRUE, showWarnings = FALSE)
 sc <- spark_connect(master = "local", version = SPARK_VERSION, config = cfg)
-say("Spark connected. Driver memory ", DRIVER_MEM, ", cores ", CORES)
+say("Spark ", SPARK_VERSION, " connected. Driver memory ", DRIVER_MEM, ", cores ", CORES)
 
 # ---------------------------------------------------------------------
-# 2. READ THE PARQUET AND BUILD THE BASE TABLE
-#    Harvey's filter: use_for_model = 1 (dup_flag = 0 and a valid emotion)
+# 2. BASE TABLE
+# Keep dup_flag = 0 and a valid emotion. Step 4 removes lyrics_dup_flag = 1.
 # ---------------------------------------------------------------------
 hdr("STEP 2: read parquet and select columns")
 in_norm <- normalizePath(IN_PATH, winslash = "/")
@@ -112,7 +132,7 @@ raw <- spark_read_parquet(sc, "raw_clean", in_norm, memory = FALSE)
 cols <- colnames(raw)
 say("Parquet has ", length(cols), " columns.")
 
-need <- c("row_id", "emotion", "use_for_model", "mean_similarity", AUDIO9)
+need <- c("row_id", "emotion", "use_for_model", "dup_flag", "lyrics_dup_flag", "mean_similarity", AUDIO9)
 absent <- setdiff(need, cols)
 lyrics_col <- intersect(c("lyrics", "text"), cols)[1]
 artist_col <- intersect(c("first_artist", "artist"), cols)[1]
@@ -120,7 +140,9 @@ if (length(absent) || is.na(lyrics_col) || is.na(artist_col)) {
   say("Missing columns: ", paste(absent, collapse = ", "))
   say("Lyrics column found: ", lyrics_col, " | artist column found: ", artist_col)
   say("All columns: ", paste(cols, collapse = ", "))
-  stop("Column names do not match the plan. Paste the 'All columns' line to Claude.")
+  if ("lyrics_dup_flag" %in% absent)
+    say("lyrics_dup_flag is missing. Rerun 01_ingest.R.")
+  stop("Required columns not found. See 'All columns' in the log.")
 }
 artist_expr <- if (artist_col == "first_artist") "first_artist" else "trim(split(artist, ',')[0])"
 say("Lyrics column: ", lyrics_col, " | artist source: ", artist_col,
@@ -133,49 +155,107 @@ cls_in <- paste(sprintf("'%s'", CLASSES), collapse = ",")
 
 reg(sdf_sql(sc, sprintf("
   SELECT row_id, artist_key, emotion_c AS emotion, %s AS label, %s,
-         mean_similarity_d AS mean_similarity, lyrics
+         mean_similarity_d AS mean_similarity, dup_flag, lyrics_dup_flag, use_for_model, lyrics
   FROM (
     SELECT CAST(row_id AS BIGINT) AS row_id,
            coalesce(lower(trim(CAST(%s AS STRING))), concat('__row_', CAST(row_id AS STRING))) AS artist_key,
            lower(trim(emotion)) AS emotion_c,
            %s,
            CAST(mean_similarity AS DOUBLE) AS mean_similarity_d,
+           CAST(dup_flag AS INT) AS dup_flag,
+           CAST(lyrics_dup_flag AS INT) AS lyrics_dup_flag,
+           CAST(use_for_model AS INT) AS use_for_model,
            CAST(`%s` AS STRING) AS lyrics
     FROM raw_clean
-    WHERE CAST(use_for_model AS INT) = 1
+    WHERE CAST(dup_flag AS INT) = 0
   ) WHERE emotion_c IN (%s)",
                         label_expr, paste(AUDIO9, collapse = ", "),
                         artist_expr, audio_cast, lyrics_col, cls_in)), "base_all")
 
+n_raw_rows <- sdf_nrow(raw)
 n_all <- sdf_nrow(tbl(sc, "base_all"))
-say("Rows with use_for_model = 1 and a valid emotion: ", format(n_all, big.mark = ","))
-if (n_all != EXPECTED_BASE) say("WARNING: expected ", format(EXPECTED_BASE, big.mark = ","), " rows (Harvey's modelling set).")
+say("Rows in parquet: ", format(n_raw_rows, big.mark = ","))
+say("Rows with dup_flag = 0 and a valid emotion (base table): ", format(n_all, big.mark = ","))
+fl_all <- sdf_sql(sc, "SELECT COALESCE(SUM(CASE WHEN lyrics_dup_flag = 1 THEN 1 ELSE 0 END), 0) AS n_lyr_flag,
+                              COALESCE(SUM(use_for_model), 0) AS n_ufm FROM base_all") %>% collect()
+n_lyr_flag_all <- as.numeric(fl_all$n_lyr_flag)
+n_ufm          <- as.numeric(fl_all$n_ufm)
+say("  of which lyrics_dup_flag = 1 (identical lyrics, removed in Step 4): ", format(n_lyr_flag_all, big.mark = ","))
+say("  rows with use_for_model = 1: ", format(n_ufm, big.mark = ","))
+if (n_all - n_lyr_flag_all != n_ufm) {
+  say("WARNING: base rows minus lyrics_dup_flag rows (", format(n_all - n_lyr_flag_all, big.mark = ","),
+      ") differ from use_for_model = 1 (", format(n_ufm, big.mark = ","), "). Check use_for_model.")
+  } else say("Check: base rows minus lyrics_dup_flag rows = use_for_model rows -> PASS")
+if (!is.na(EXPECTED_MODEL_READY) && n_ufm != EXPECTED_MODEL_READY)
+  say("WARNING: expected ", format(EXPECTED_MODEL_READY, big.mark = ","), " model_ready rows, found ", format(n_ufm, big.mark = ","))
+
 n_dup_id <- sdf_sql(sc, "SELECT COUNT(*) - COUNT(DISTINCT row_id) AS d FROM base_all") %>% collect()
 say("Duplicate row_id values: ", n_dup_id$d, " (must be 0)")
 if (n_dup_id$d != 0) stop("row_id is not unique.")
 
 # ---------------------------------------------------------------------
-# 3. LYRICS CLEANING AND USABLE-LYRICS CHECK
-# Cleaning chain (the same expression is used for hashing and for tokenising):
-#   1a/1b strip [...] tags: one line, no inner bracket, at most 300 characters, run twice
-#   2     curly apostrophes and backtick -> '
-#   3     lower-case
-#   4     keep letters a-z, apostrophes, spaces
-#   5     drop apostrophes that are not inside a word (friends' -> friends, 'cause -> cause)
-#   6     collapse whitespace
+# 3. LYRICS CLEANING
+# Lyrics cleaning rules:
+#   1a/1b  strip [...] tags (one line, max 300 chars, two passes)
+#   1c     strip tags with bad brackets: [Verse 1}  {Chorus]
+#   1d     delete lines that are only a section label
+#   1e     delete a label prefix: "Chorus: la la" -> "la la"
+#   1f     delete (Chorus) / (Verse 2) in round brackets
+#   2      curly apostrophes -> '
+#   3      lower-case
+#   4      keep only a-z, apostrophes, spaces
+#   5      drop apostrophes outside words
+#   6      collapse whitespace
+# Common words like break, drop, part are not in the label list.
 # ---------------------------------------------------------------------
-rx <- function(e, pat, rep) sprintf("regexp_replace(%s, %s, %s)", e, pat, rep)
+rx  <- function(e, pat, rep) sprintf("regexp_replace(%s, %s, %s)", e, pat, rep)
+lit <- function(p) paste0("'", p, "'")        # regex -> Spark SQL string literal
 tag_pat <- r"---('\\[[^\\[\\]\\r\\n]{0,300}\\]')---"
+
+LAB <- "verse|chorus|bridge|intro|outro|hook|refrain|interlude|instrumental|solo|breakdown|spoken|skit"
+# 1c: [ or { + section word + up to 60 chars + optional ] or }
+br_mis_pat <- lit(paste0(r"---((?i)[\\[{][ \\t]*(?:pre[- ]?|post[- ]?)?()---", LAB,
+                         r"---()(?![a-z])[^\\[\\]{}\\r\\n]{0,60}[\\]}]?)---"))
+# 1d: whole line is only a label
+whole_pat  <- lit(paste0(r"---((?mi)^[ \\t]*(?:pre[- ]?|post[- ]?)?()---", LAB,
+                         r"---()(?:[ \\t]*[0-9]+|[ \\t]+[ivx]+)?(?:[ \\t]*(?:x[0-9]+|[0-9]+x))?[ \\t:]*[\\r]*$)---"))
+# 1e: label with colon at line start, followed by text
+prefix_pat <- lit(paste0(r"---((?mi)^[ \\t]*(?:pre[- ]?|post[- ]?)?()---", LAB,
+                         r"---()(?:[ \\t]*[0-9]+)?[ \\t]*:[ \\t]*(?=\\S))---"))
+# 1f: label-only round brackets, real lyrics are kept
+paren_pat  <- lit(paste0(r"---((?i)\\((?:pre[- ]?|post[- ]?)?()---", LAB,
+                         r"---()(?![a-z])(?:[ \\t]*[0-9]+|[ \\t]+[ivx]+)?(?:[ \\t]*(?:x[0-9]+|[0-9]+x))?[ \\t]*\\))---"))
+
 e <- "coalesce(lyrics, '')"
-e <- rx(e, tag_pat, "' '")                                        # 1a. strip tags
-e <- rx(e, tag_pat, "' '")                                        # 1b. second pass (nested tags)
-e <- rx(e, r"---('[\\u2019\\u2018\\u0060]')---", "\"'\"")        # 2. curly apostrophes -> '
-e <- sprintf("lower(%s)", e)                                      # 3. lower-case
-e <- rx(e, "\"[^a-z' ]\"", "' '")                                 # 4. keep letters, apostrophes, spaces
-e <- rx(e, "\"(?<![a-z])'|'(?![a-z])\"", "' '")                  # 5. drop apostrophes not inside a word
-e <- sprintf("trim(%s)", rx(e, r"---('\\s+')---", "' '"))         # 6. collapse whitespace
+e <- rx(e, tag_pat, "' '")                                        # 1a
+e <- rx(e, tag_pat, "' '")                                        # 1b
+e <- rx(e, br_mis_pat, "' '")                                     # 1c
+e <- rx(e, whole_pat, "' '")                                      # 1d
+e <- rx(e, prefix_pat, "''")                                      # 1e
+e <- rx(e, paren_pat, "' '")                                      # 1f
+e <- rx(e, r"---('[\\u2019\\u2018\\u0060]')---", "\"'\"")        # 2
+e <- sprintf("lower(%s)", e)                                      # 3
+e <- rx(e, "\"[^a-z' ]\"", "' '")                                 # 4
+e <- rx(e, "\"(?<![a-z])'|'(?![a-z])\"", "' '")                  # 5
+e <- sprintf("trim(%s)", rx(e, r"---('\\s+')---", "' '"))         # 6
 
 hdr("STEP 3: lyrics cleaning and usable-lyrics check")
+
+# PILOT only: show the most common strings each rule deletes
+if (SPOT_CHECK) {
+  say("Spot-check on a 5% sample of songs: most common strings each rule deletes")
+  spot <- function(pat, n = 30) sdf_sql(sc, paste0(
+    "SELECT lower(trim(m)) AS matched, COUNT(*) AS n FROM (",
+    "SELECT explode(regexp_extract_all(lyrics, ", pat, ", 0)) AS m FROM base_all ",
+    "WHERE pmod(hash(row_id), 100) < 5) GROUP BY lower(trim(m)) ORDER BY n DESC LIMIT ", n)) %>% collect()
+  for (nm in c("1c mismatched brackets", "1d whole-line labels", "1e prefix labels", "1f round-bracket labels")) {
+    p <- switch(substr(nm, 1, 2), "1c" = br_mis_pat, "1d" = whole_pat, "1e" = prefix_pat, "1f" = paren_pat)
+    say("\n-- ", nm)
+    say_df(spot(p))
+  }
+  say("")
+}
+
 lyr_q <- sprintf("
   SELECT row_id,
          CASE WHEN lyrics IS NULL THEN 'null'
@@ -195,7 +275,7 @@ say("Lyrics status (null = missing, blank = whitespace only, empty_after_cleanin
 say_df(st %>% arrange(desc(n)))
 n_bad <- sum(st$n[st$lyr_status != "ok"])
 say("Songs with no usable lyrics (removed): ", format(n_bad, big.mark = ","),
-    " (", round(100 * n_bad / n_all, 4), "% of the base). The old bracket rule removed 2 songs here.")
+    " (", round(100 * n_bad / n_all, 4), "% of the base).")
 if (n_bad > 0) {
   bad_s <- sdf_sql(sc, "
     SELECT b.row_id, b.emotion, substr(b.lyrics, 1, 80) AS lyrics_start
@@ -206,56 +286,66 @@ if (n_bad > 0) {
 }
 
 # ---------------------------------------------------------------------
-# 4. REMOVE SONGS WITH IDENTICAL CLEANED LYRICS, BEFORE THE SPLIT
-# Rule: songs with the same MD5 of the cleaned lyrics form a group; the song
-# with the smallest row_id is kept, the others are dropped. Harvey's dup_flag
-# (same artist and title) has already been applied in Step 2.
+# 4. REMOVE DUPLICATE LYRICS (before the split)
+# 4a: lyrics_dup_flag = 1 (from 01_ingest.R) marks later copies of identical raw lyrics
+# 4b: songs identical only after lyrics cleaning (keep smallest row_id)
 # ---------------------------------------------------------------------
-hdr("STEP 4: duplicate lyrics removed BEFORE the split")
+hdr("STEP 4: remove duplicate lyrics (lyrics_dup_flag), BEFORE the split")
 reg(sdf_sql(sc, "
-  SELECT row_id, lyr_hash,
-         ROW_NUMBER() OVER (PARTITION BY lyr_hash ORDER BY row_id) AS rn
-  FROM lyr_clean_tbl WHERE lyr_status = 'ok'"), "dedup_rank")
-reg(sdf_sql(sc, "SELECT row_id FROM dedup_rank WHERE rn = 1"), "keep_ids")
+  SELECT b.row_id, b.emotion, b.lyrics_dup_flag, c.lyr_hash
+  FROM base_all b JOIN lyr_clean_tbl c ON b.row_id = c.row_id
+  WHERE c.lyr_status = 'ok'"), "lyr_ok")
 
-dg <- sdf_sql(sc, "
-  SELECT COUNT(*) AS dup_groups,
-         COALESCE(SUM(n - 1), 0) AS rows_removed,
-         COALESCE(MAX(n), 0) AS largest_group,
-         COALESCE(SUM(CASE WHEN n_emo > 1 THEN 1 ELSE 0 END), 0) AS groups_conflicting_emotion
-  FROM (SELECT c.lyr_hash, COUNT(*) AS n, COUNT(DISTINCT b.emotion) AS n_emo
-        FROM lyr_clean_tbl c JOIN base_all b ON c.row_id = b.row_id
-        WHERE c.lyr_status = 'ok' GROUP BY c.lyr_hash HAVING COUNT(*) > 1)") %>% collect()
-n_dup_removed <- as.numeric(dg$rows_removed)
-say("Groups of identical cleaned lyrics: ", format(dg$dup_groups, big.mark = ","))
-say("Songs removed (all but the smallest row_id in each group): ", format(n_dup_removed, big.mark = ","),
-    " (", round(100 * n_dup_removed / (n_all - n_bad), 3), "% of the base)")
-say("Largest group: ", dg$largest_group, " songs | groups whose songs carry different emotion labels: ",
-    format(dg$groups_conflicting_emotion, big.mark = ","))
-
-if (n_dup_removed > 0) {
-  rem_emo <- sdf_sql(sc, "
-    SELECT b.emotion, COUNT(*) AS removed FROM base_all b JOIN dedup_rank d ON b.row_id = d.row_id
-    WHERE d.rn > 1 GROUP BY b.emotion") %>% collect()
-  say("Removed songs by emotion:"); say_df(rem_emo %>% arrange(desc(removed)))
-  top_g <- sdf_sql(sc, "
-    SELECT COUNT(*) AS songs, MIN(substr(lyr_clean, 1, 70)) AS cleaned_lyrics_start
-    FROM lyr_clean_tbl WHERE lyr_status = 'ok'
-    GROUP BY lyr_hash HAVING COUNT(*) > 1 ORDER BY songs DESC LIMIT 5") %>% collect()
-  say("Five largest duplicate groups (placeholder texts such as 'instrumental' collapse to one song):")
-  say_df(top_g)
-  if (n_dup_removed / (n_all - n_bad) > 0.05) say("WARNING: more than 5% of songs removed as duplicate lyrics. Look at why before going on.")
+fl <- sdf_sql(sc, "SELECT COUNT(*) AS n_ok,
+                          COALESCE(SUM(CASE WHEN lyrics_dup_flag = 1 THEN 1 ELSE 0 END), 0) AS n_flagged
+                   FROM lyr_ok") %>% collect()
+n_flag_removed <- as.numeric(fl$n_flagged)
+say("4a. Songs with usable lyrics: ", format(as.numeric(fl$n_ok), big.mark = ","))
+say("    Removed because lyrics_dup_flag = 1: ", format(n_flag_removed, big.mark = ","),
+    " (", round(100 * n_flag_removed / max(1, n_all - n_bad), 3), "% of the base)")
+if (n_lyr_flag_all > n_flag_removed)
+  say("    (", format(n_lyr_flag_all - n_flag_removed, big.mark = ","),
+      " other flagged rows were already counted as unusable lyrics in Step 3)")
+if (n_flag_removed > 0) {
+  rem_emo <- sdf_sql(sc, "SELECT emotion, COUNT(*) AS removed_by_flag FROM lyr_ok
+                          WHERE lyrics_dup_flag = 1 GROUP BY emotion") %>% collect()
+  say("    Removed by emotion:"); say_df(rem_emo %>% arrange(desc(removed_by_flag)))
 }
+
+# 4b
+reg(sdf_sql(sc, "SELECT row_id, lyr_hash FROM lyr_ok WHERE lyrics_dup_flag = 0"), "flag_kept")
+reg(sdf_sql(sc, "SELECT row_id, ROW_NUMBER() OVER (PARTITION BY lyr_hash ORDER BY row_id) AS rn
+                 FROM flag_kept"), "dedup_rank")
+n_resid <- as.numeric(sdf_sql(sc, "SELECT COALESCE(SUM(CASE WHEN rn > 1 THEN 1 ELSE 0 END), 0) AS n
+                                   FROM dedup_rank") %>% collect() %>% pull(n))
+n_resid_removed <- if (REMOVE_CLEANED_DUPS) n_resid else 0
+say("4b. Extra duplicates after tag cleaning (not caught by the flag): ", format(n_resid, big.mark = ","),
+    if (REMOVE_CLEANED_DUPS) " -> removed (smallest row_id kept)" else " -> NOT removed (REMOVE_CLEANED_DUPS = FALSE)")
+if (n_resid > 0) {
+  top_g <- sdf_sql(sc, "
+    SELECT COUNT(*) AS songs, MIN(substr(c.lyr_clean, 1, 70)) AS cleaned_lyrics_start
+    FROM flag_kept k JOIN lyr_clean_tbl c ON k.row_id = c.row_id
+    GROUP BY c.lyr_hash HAVING COUNT(*) > 1 ORDER BY songs DESC LIMIT 5") %>% collect()
+  say("    Five largest residual groups (placeholder texts such as 'instrumental' collapse to one song):")
+  say_df(top_g)
+}
+reg(sdf_sql(sc, if (REMOVE_CLEANED_DUPS) "SELECT row_id FROM dedup_rank WHERE rn = 1"
+            else "SELECT row_id FROM flag_kept"), "keep_ids")
+
+n_dup_removed <- n_flag_removed + n_resid_removed
+if (n_dup_removed / max(1, n_all - n_bad) > 0.05)
+  say("WARNING: more than 5% of songs removed as duplicate lyrics. Check the cleaning.")
 
 reg(sdf_sql(sc, sprintf("
   SELECT b.row_id, b.artist_key, b.emotion, b.label, %s, b.mean_similarity
   FROM base_all b JOIN keep_ids k ON b.row_id = k.row_id", paste0("b.", AUDIO9, collapse = ", "))), "base_dedup")
 n_dedup <- sdf_nrow(tbl(sc, "base_dedup"))
 say("Base rows after removals: ", format(n_dedup, big.mark = ","), " (", format(n_all, big.mark = ","),
-    " minus ", format(n_bad, big.mark = ","), " unusable minus ", format(n_dup_removed, big.mark = ","), " duplicate lyrics)")
+    " minus ", format(n_bad, big.mark = ","), " unusable minus ", format(n_flag_removed, big.mark = ","),
+    " lyrics_dup_flag minus ", format(n_resid_removed, big.mark = ","), " cleaned-lyric duplicates)")
 if (n_dedup != n_all - n_bad - n_dup_removed) stop("Row count after removals does not reconcile.")
-say("Count table for Section 4.1: 551,443 raw -> ", format(n_all, big.mark = ","),
-    " after Harvey's filter -> ", format(n_dedup, big.mark = ","), " after Stage 2 removals.")
+say("Row-count: ", format(n_raw_rows, big.mark = ","), " raw -> ", format(n_all, big.mark = ","),
+    " after dup_flag and emotion filter -> ", format(n_dedup, big.mark = ","), " after removals.")
 
 if (PILOT) {
   reg(sdf_sql(sc, sprintf(
@@ -269,7 +359,8 @@ if (PILOT) {
 n_pre <- sdf_nrow(tbl(sc, "base_pre"))
 
 # ---------------------------------------------------------------------
-# 5. ARTIST SPLIT WITH ACCEPTANCE CHECK
+# 5. ARTIST SPLIT
+# All songs of one artist go to the same side.
 # ---------------------------------------------------------------------
 hdr("STEP 5: 80/20 artist split")
 evaluate_split <- function(salt) {
@@ -290,26 +381,26 @@ for (i in seq_along(SALTS)) {
   r <- evaluate_split(SALTS[i])
   say("Salt '", SALTS[i], "': max class-share deviation = ", round(r$maxdev, 3), " points (tolerance ", TOL_PTS, ")")
   if (r$maxdev <= TOL_PTS || PILOT || i == length(SALTS)) { chosen <- i; break }
-  say("  Check failed, changing the salt once (document this in Section 4.2).")
+  say("  Check failed, trying the second salt.")
 }
-if (!PILOT && r$maxdev > TOL_PTS) say("WARNING: second salt also above tolerance. Report the deviation honestly.")
+if (!PILOT && r$maxdev > TOL_PTS) say("WARNING: second salt also above tolerance.")
 say("Salt used: ", SALTS[chosen])
 say_df(r$tab %>% mutate(across(c(share, share_all, dev_pts), ~ round(.x, 2))))
 
 by_split <- sdf_sql(sc, "SELECT split, COUNT(DISTINCT artist_key) AS artists, COUNT(*) AS songs FROM base_split GROUP BY split") %>% collect()
 say_df(by_split)
 say("Artist share in train : ", round(100 * by_split$artists[by_split$split == "train"] / sum(by_split$artists), 2), "%")
-say("Row ratio (train/all) : ", round(100 * by_split$songs[by_split$split == "train"] / sum(by_split$songs), 2), "%  (this is the ratio actually obtained)")
+say("Row ratio (train/all) : ", round(100 * by_split$songs[by_split$split == "train"] / sum(by_split$songs), 2), "%")
 leak <- sdf_sql(sc, "SELECT COUNT(*) AS n FROM (SELECT artist_key FROM base_split GROUP BY artist_key HAVING COUNT(DISTINCT split) > 1)") %>% collect()
 say("Artists present in BOTH train and test: ", leak$n, " (must be 0)")
 if (leak$n != 0) stop("Artist leakage in split.")
 
 readr::write_csv(
   sdf_sql(sc, "SELECT artist_key, split, COUNT(*) AS songs FROM base_split GROUP BY artist_key, split") %>% collect(),
-  file.path(OUT_DIR, "split_table.csv"))
+  file.path(RES_DIR, "split_table.csv"))
 
 # ---------------------------------------------------------------------
-# 6. TOKENISING AND STOP WORDS (cleaned text comes from Step 3)
+# 6. TOKENISE AND REMOVE STOP WORDS
 # ---------------------------------------------------------------------
 hdr("STEP 6: tokenising and stop words")
 reg(sdf_sql(sc, sprintf("
@@ -317,9 +408,9 @@ reg(sdf_sql(sc, sprintf("
   FROM base_split s JOIN lyr_clean_tbl c ON s.row_id = c.row_id",
                         paste0("s.", AUDIO9, collapse = ", "))), "cleaned")
 
-stops_all <- unlist(ml_default_stop_words(sc, "english"))   # sparklyr returns a list; make it a character vector
+stops_all <- unlist(ml_default_stop_words(sc, "english"))
 neg <- stops_all[stops_all %in% c("no", "nor", "not", "cannot") | grepl("n't$", stops_all)]
-STOPS <- setdiff(stops_all, neg)
+STOPS <- setdiff(stops_all, neg)   # keep negations
 say("Spark English stop words: ", length(stops_all), " | negations kept (removed from list): ", length(neg),
     " | final list: ", length(STOPS))
 say("Negations kept: ", paste(sort(neg), collapse = ", "))
@@ -338,8 +429,7 @@ say("Rows after cleaning/tokenising: ", format(sdf_nrow(tok_all), big.mark = ","
 n_empty <- sdf_sql(sc, "SELECT SUM(CASE WHEN size(tokens) = 0 THEN 1 ELSE 0 END) AS z FROM tok_all") %>% collect()
 say("Songs whose tokens are all stop words (kept, zero lyric vector): ", n_empty$z)
 
-# Sanity check: leftover [Verse]/[Chorus] words. The old rule gave 4.9% (full run).
-# A large rise would mean the new rule leaves many tags in the text.
+# Check leftover section words
 smp <- sdf_sql(sc, "SELECT emotion, concat_ws(' ', slice(tokens, 1, 25)) AS first_tokens FROM tok_all LIMIT 3") %>% collect()
 say("Sample cleaned tokens (first 25 per song):")
 for (i in seq_len(nrow(smp))) say("  [", smp$emotion[i], "] ", smp$first_tokens[i])
@@ -349,24 +439,33 @@ tagchk <- sdf_sql(sc, "
          COUNT(*) AS n FROM tok_all") %>% collect()
 share_tag <- tagchk$n_tag / tagchk$n
 say("Songs still containing the token verse, chorus or bridge: ", tagchk$n_tag, " (",
-    round(100 * share_tag, 2), "%). Old rule: 4.9% (full run). Expect a similar value.")
-if (share_tag > 0.10) stop("Tag stripping looks like it failed (over 10% of songs still contain verse/chorus/bridge). Paste the sample lines to Claude.")
+    round(100 * share_tag, 2), "%). Most are real lyric words.")
+if (share_tag > 0.10) stop("Tag cleaning failed: over 10% of songs still contain section words.")
 
 # ---------------------------------------------------------------------
-# 7. ZERO CHECK: no identical cleaned lyrics left, none across the boundary
+# 7. ZERO CHECK
 # ---------------------------------------------------------------------
 hdr("STEP 7: zero check for duplicate lyrics")
+n_flag_left <- as.numeric(sdf_sql(sc, "
+  SELECT COUNT(*) AS n FROM base_split s JOIN base_all b ON s.row_id = b.row_id
+  WHERE b.lyrics_dup_flag = 1") %>% collect() %>% pull(n))
+say("Rows with lyrics_dup_flag = 1 still in the split: ", n_flag_left, " (must be 0)")
+if (n_flag_left != 0) stop("Flagged duplicate lyrics are still in the split.")
+
 dchk <- sdf_sql(sc, "
   SELECT COUNT(*) - COUNT(DISTINCT c.lyr_hash) AS repeated_rows,
          (SELECT COUNT(*) FROM (SELECT c2.lyr_hash FROM base_split s2 JOIN lyr_clean_tbl c2 ON s2.row_id = c2.row_id
                                 GROUP BY c2.lyr_hash HAVING COUNT(DISTINCT s2.split) > 1)) AS hashes_in_both_splits
   FROM base_split s JOIN lyr_clean_tbl c ON s.row_id = c.row_id") %>% collect()
-say("Repeated cleaned-lyric rows left: ", dchk$repeated_rows, " (must be 0) | lyric hashes present in both train and test: ",
-    dchk$hashes_in_both_splits, " (must be 0)")
-if (dchk$repeated_rows != 0 || dchk$hashes_in_both_splits != 0) stop("Duplicate lyrics remain after Step 4.")
+say("Repeated cleaned-lyric rows left: ", dchk$repeated_rows, " | cleaned-lyric hashes in both train and test: ",
+    dchk$hashes_in_both_splits, if (REMOVE_CLEANED_DUPS) " (both must be 0)" else " (info only)")
+if (dchk$repeated_rows != 0 || dchk$hashes_in_both_splits != 0) {
+  if (REMOVE_CLEANED_DUPS) stop("Duplicate lyrics remain after Step 4.")
+  say("WARNING: duplicate lyrics remain, possible small leakage.")
+}
 
 # ---------------------------------------------------------------------
-# 8. MIN-MAX SCALING FITTED ON TRAIN ONLY
+# 8. MIN-MAX SCALING (train only, test clipped to [0, 1])
 # ---------------------------------------------------------------------
 hdr("STEP 8: min-max scaling (train only) with test clipped to [0, 1]")
 src_expr <- c(setNames(AUDIO9, AUDIO9), mean_similarity = "mean_similarity")
@@ -374,8 +473,8 @@ src_expr <- c(setNames(AUDIO9, AUDIO9), mean_similarity = "mean_similarity")
 chk <- paste(sprintf("SUM(CASE WHEN %s IS NULL THEN 1 ELSE 0 END) AS na_%s",
                      names(src_expr), names(src_expr)), collapse = ", ")
 na_res <- sdf_sql(sc, paste("SELECT", chk, "FROM tok_all")) %>% collect()
-say("NULL values in numeric features: ", sum(unlist(na_res)), " (must be 0 after Stage 1 imputation)")
-if (sum(unlist(na_res)) > 0) stop("NULLs found in numeric features. Check Stage 1 output.")
+say("NULL values in numeric features: ", sum(unlist(na_res)), " (must be 0)")
+if (sum(unlist(na_res)) > 0) stop("NULLs found in numeric features. Check 01_ingest.R output.")
 
 q <- paste0("SELECT ",
             paste(sprintf("MIN(%1$s) AS mn_%2$s, MAX(%1$s) AS mx_%2$s", src_expr, names(src_expr)), collapse = ", "),
@@ -384,7 +483,7 @@ mm_row <- sdf_sql(sc, q) %>% collect()
 mm <- data.frame(feature = names(src_expr),
                  train_min = unlist(mm_row[paste0("mn_", names(src_expr))], use.names = FALSE),
                  train_max = unlist(mm_row[paste0("mx_", names(src_expr))], use.names = FALSE))
-readr::write_csv(mm, file.path(OUT_DIR, "minmax_table.csv"))
+readr::write_csv(mm, file.path(RES_DIR, "minmax_table.csv"))
 say_df(mm)
 
 scale_one <- function(expr, mn, mx) {
@@ -404,7 +503,7 @@ say("Negative values check: ", if (rng$mn >= 0) "PASS (no negatives, safe for Na
 if (rng$mn < 0) stop("Negative values present; Naive Bayes would fail.")
 
 # ---------------------------------------------------------------------
-# 9. TF-IDF FITTED ON TRAIN ONLY
+# 9. TF-IDF (train only)
 # ---------------------------------------------------------------------
 hdr("STEP 9: TF-IDF (fitted on train only)")
 scaled_all   <- tbl(sc, "scaled_all")
@@ -416,7 +515,11 @@ if (!USE_HASHING_FALLBACK) {
   vocab <- cv_model$vocabulary
   say("CountVectorizer vocabulary size: ", length(vocab), " (cap ", VOCAB_SIZE, ", minDF ", MIN_DF, ")")
   say("Top 15 terms by frequency: ", paste(head(vocab, 15), collapse = ", "))
-  readr::write_csv(data.frame(index = seq_along(vocab) - 1L, term = vocab), file.path(OUT_DIR, "vocabulary.csv"))
+  # Section words should rank low in the vocabulary
+  lab_rank <- match(c("verse", "chorus", "hook", "bridge", "intro", "outro"), vocab)
+  say("Vocabulary rank (1 = most frequent) of verse, chorus, hook, bridge, intro, outro: ",
+      paste(ifelse(is.na(lab_rank), "not in vocab", lab_rank), collapse = ", "))
+  readr::write_csv(data.frame(index = seq_along(vocab) - 1L, term = vocab), file.path(RES_DIR, "vocabulary.csv"))
   tf_fun <- function(df) ml_transform(cv_model, df)
 } else {
   hv <- ft_hashing_tf(sc, input_col = "tokens", output_col = "tf", num_features = HASH_FEATURES)
@@ -429,7 +532,7 @@ say("IDF fitted on ", format(sdf_nrow(scaled_train), big.mark = ","), " training
 with_tfidf <- scaled_all %>% tf_fun() %>% ml_transform(idf_model, .)
 
 # ---------------------------------------------------------------------
-# 10. FEATURE VECTORS, LABELS AND CLASS WEIGHTS
+# 10. FEATURE VECTORS AND CLASS WEIGHTS
 # ---------------------------------------------------------------------
 hdr("STEP 10: assemble vectors and class weights")
 a9  <- ft_vector_assembler(sc, input_cols = paste0("s_", AUDIO9), output_col = "f_audio9")
@@ -443,7 +546,7 @@ cls_cnt$weight <- N_train / (length(CLASSES) * cls_cnt$n)
 cls_cnt$emotion <- CLASSES[cls_cnt$label + 1]
 say("Class weights = N / (6 x class count), from train only (N = ", format(N_train, big.mark = ","), ")")
 say_df(cls_cnt %>% mutate(weight = round(weight, 4)) %>% select(label, emotion, n, weight))
-readr::write_csv(cls_cnt %>% select(label, emotion, n, weight), file.path(OUT_DIR, "class_weights.csv"))
+readr::write_csv(cls_cnt %>% select(label, emotion, n, weight), file.path(RES_DIR, "class_weights.csv"))
 w_expr <- paste0("CASE label ", paste(sprintf("WHEN %d.0 THEN %.15g", cls_cnt$label, cls_cnt$weight), collapse = " "), " END")
 
 reg(assembled %>% select(row_id, artist_key, emotion, label, split, f_audio9, tfidf, f_combined), "assembled")
@@ -455,7 +558,7 @@ spark_write_parquet(final, FINAL_PATH, mode = "overwrite")
 fin <- spark_read_parquet(sc, "final_all", FINAL_PATH, memory = FALSE)
 
 # ---------------------------------------------------------------------
-# 11. WRITE THE SIX HANDOFF FILES AND VERIFY THEM
+# 11. WRITE, CHECK AND COPY THE SIX FILES
 # ---------------------------------------------------------------------
 hdr("STEP 11: write the six parquet files")
 out_specs <- list(
@@ -466,9 +569,10 @@ out_specs <- list(
   combined_train = "SELECT row_id, artist_key, emotion, label, weight, f_combined AS features FROM final_all WHERE split = 'train'",
   combined_test  = "SELECT row_id, artist_key, emotion, label, f_combined AS features FROM final_all WHERE split = 'test'"
 )
+
 counts <- data.frame(file = character(), rows = numeric())
 for (nm in names(out_specs)) {
-  p <- file.path(OUT_DIR, paste0(nm, ".parquet"))
+  p <- file.path(WORK_DIR, paste0(nm, ".parquet"))
   spark_write_parquet(sdf_sql(sc, out_specs[[nm]]), p, mode = "overwrite")
   n <- sdf_nrow(spark_read_parquet(sc, paste0("chk_", nm), p, memory = FALSE))
   counts <- rbind(counts, data.frame(file = paste0(nm, ".parquet"), rows = n))
@@ -493,7 +597,21 @@ for (sp in c("train", "test")) {
 }
 
 fe <- sdf_sql(sc, "SELECT split, emotion, COUNT(*) AS n FROM final_all GROUP BY split, emotion ORDER BY split, emotion") %>% collect()
-say("Final emotion counts per split (use these numbers in the report):"); say_df(fe)
+say("Final emotion counts per split:"); say_df(fe)
+
+# Close Spark, then copy files to data/processed
+spark_disconnect(sc)
+say("Copying the six files to ", FEATURE_DIR, " ...")
+for (nm in names(out_specs)) {
+  src <- file.path(WORK_DIR, paste0(nm, ".parquet"))
+  dst <- file.path(FEATURE_DIR, paste0(nm, ".parquet"))
+  if (identical(normalizePath(src, winslash = "/", mustWork = FALSE),
+                normalizePath(dst, winslash = "/", mustWork = FALSE))) next
+  unlink(dst, recursive = TRUE)
+  ok <- file.copy(src, FEATURE_DIR, recursive = TRUE)
+  if (!isTRUE(ok)) stop("Could not copy ", src, " to ", FEATURE_DIR)
+}
+say("Copy finished: ", paste(file.exists(file.path(FEATURE_DIR, paste0(names(out_specs), ".parquet"))), collapse = ", "))
 
 # ---------------------------------------------------------------------
 # SUMMARY
@@ -502,16 +620,15 @@ hdr("SUMMARY")
 n_text <- if (USE_HASHING_FALLBACK) HASH_FEATURES else length(vocab)
 say("Mode               : ", if (PILOT) "PILOT" else "FULL")
 say("Salt used          : ", SALTS[chosen])
-say("Rows: raw 551,443 -> Harvey filter ", format(n_all, big.mark = ","),
-    " -> unusable lyrics removed ", format(n_bad, big.mark = ","),
-    " -> duplicate lyrics removed ", format(n_dup_removed, big.mark = ","),
+say("Rows: raw ", format(n_raw_rows, big.mark = ","), " -> dup_flag/emotion filter ", format(n_all, big.mark = ","),
+    " -> unusable lyrics ", format(n_bad, big.mark = ","),
+    " -> lyrics_dup_flag removed ", format(n_flag_removed, big.mark = ","),
+    " -> cleaned-lyric duplicates removed ", format(n_resid_removed, big.mark = ","),
     " -> final ", format(n_dedup, big.mark = ","))
 say("Train / test rows  : ", format(counts$rows[1], big.mark = ","), " / ", format(counts$rows[2], big.mark = ","))
 say("Vector sizes       : audio = 9 | lyrics = ", n_text, " | combined = ", 10 + n_text,
     " (first 9 = audio, 10th = mean_similarity, rest = TF-IDF)")
 say("Elapsed            : ", round(difftime(Sys.time(), T0, units = "mins"), 1), " minutes")
-say("Output folder      : ", OUT_DIR)
-say("Temp folder _tmp can be deleted after the six files are handed off.")
-say("Reminder: read these files with sparklyr::spark_read_parquet (they hold Spark vectors), not arrow.")
-say("Tell teammates: artist_key and row_id are identifiers, not features.")
-spark_disconnect(sc)
+say("Feature files      : ", FEATURE_DIR)
+say("Log and tables     : ", RES_DIR)
+say("Temp folder (safe to delete): ", TMP_DIR)
