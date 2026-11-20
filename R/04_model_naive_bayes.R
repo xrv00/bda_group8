@@ -1,82 +1,90 @@
 # 04_model_naive_bayes.R
 # Owner: Tam Yi Qing (Spark Feature Engineer)
 # Purpose: Naive Bayes on the 3 feature sets
+# AI-assisted (Claude), 20 Nov 2026
+# =====================================================================
+# Reads : data/processed/{audio,lyrics,combined}_{train,test}.parquet
+# Model : multinomial Naive Bayes, smoothing 1.0, class weights
+# Writes: predictions_naive_bayes.csv, nb_metrics.csv, nb_metrics_percent.csv,
+#         nb_confusion.csv, nb_log.txt
+# =====================================================================
 
 # ---------------------------------------------------------------------
-# 0. SWITCHES AND SETTINGS (edit only this block)
+# 0. SETTINGS
 # ---------------------------------------------------------------------
-PILOT         <- FALSE      # must match the mode you ran 05_features_split.R in
-SPARK_VERSION <- "3.5.1"
-DRIVER_MEM    <- "8G"      # if Spark stalls, use "6G"
-CORES         <- 4         # if Spark stalls, use 2
-SMOOTHING     <- 1.0       # fixed in advance; do not tune on the test set
-RUN_ABLATION  <- FALSE     # 11-feature audio set dropped; the files only hold the 9-feature vector
+PILOT         <- FALSE     # must match 02_features.R
+PREFERRED_SPARK <- "3.5.1" # used if installed, else the newest installed version
+DRIVER_MEM    <- "8G"      # memory for Spark
+CORES         <- 4         # CPU cores for Spark
+SMOOTHING     <- 1.0       # Naive Bayes smoothing
 
-WORK_ROOT <- "C:/BDA_work"
-IN_DIR    <- if (PILOT) file.path(WORK_ROOT, "pilot") else WORK_ROOT
-OUT_DIR   <- IN_DIR
-CLASSES   <- c("anger", "fear", "joy", "love", "sadness", "surprise")  # label 0..5
+# Project root = working directory (or its parent if you are inside R/)
+PROJECT_ROOT <- normalizePath(getwd(), winslash = "/")
+if (basename(PROJECT_ROOT) == "R") PROJECT_ROOT <- dirname(PROJECT_ROOT)
+
+PROC_DIR  <- file.path(PROJECT_ROOT, "data", "processed")
+IN_DIR    <- if (PILOT) file.path(PROC_DIR, "pilot") else PROC_DIR
+PRED_DIR  <- if (PILOT) file.path(PROJECT_ROOT, "outputs", "pilot") else file.path(PROJECT_ROOT, "outputs")
+RES_DIR   <- file.path(PRED_DIR, "naive_bayes")       # metrics, confusion matrices, log
+
+# Spark temp folder
+WORK_ROOT <- Sys.getenv("BDA_WORK_ROOT",
+                        unset = if (.Platform$OS.type == "windows") "C:/BDA_work"
+                        else file.path(path.expand("~"), "BDA_work"))
+CLASSES   <- c("anger", "fear", "joy", "love", "sadness", "surprise")  # labels 0..5
 
 # ---------------------------------------------------------------------
-# 1. PACKAGES, LOGGING, ENVIRONMENT CHECK
+# 1. PACKAGES, LOGGING, SPARK CONNECTION
 # ---------------------------------------------------------------------
 pk <- c("sparklyr", "dplyr", "readr")
 miss <- pk[!pk %in% rownames(installed.packages())]
 if (length(miss)) install.packages(miss)
 suppressPackageStartupMessages({ library(sparklyr); library(dplyr) })
 
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
-LOG <- file.path(OUT_DIR, "nb_log.txt")
+for (d in c(PRED_DIR, RES_DIR)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+LOG <- file.path(RES_DIR, "nb_log.txt")
 if (file.exists(LOG)) file.remove(LOG)
 say  <- function(...) { m <- paste0(...); cat(m, "\n"); cat(m, "\n", file = LOG, append = TRUE) }
 hdr  <- function(t) say("\n==== ", t, " ====")
 say_df <- function(d) for (l in capture.output(print(as.data.frame(d), row.names = FALSE))) say(l)
+pct <- function(x, digits = 2) sprintf(paste0("%.", digits, "f%%"), 100 * x)   # 0.4 -> "40.00%"
 T0 <- Sys.time()
 
-hdr("STEP 1: environment")
-say("Run mode: ", if (PILOT) "PILOT (scores are not reportable)" else "FULL")
+hdr("STEP 1: Spark connection")
+say("Run mode: ", if (PILOT) "PILOT (test run)" else "FULL")
 say("Started : ", format(T0))
+say("Project root: ", PROJECT_ROOT)
 
-jv <- tryCatch(system2("java", "-version", stdout = TRUE, stderr = TRUE), error = function(e) NULL)
-if (is.null(jv)) stop("Java was not found on PATH. Install Temurin 17 and restart R.")
-m <- regmatches(jv[1], regexec('version "([0-9]+)\\.?([0-9]*)', jv[1]))[[1]]
-java_major <- as.integer(m[2]); if (java_major == 1L) java_major <- as.integer(m[3])
-say("Java major version: ", java_major)
-if (!java_major %in% c(8L, 11L, 17L))
-  stop("Spark 3.5 needs Java 8, 11 or 17. Found Java ", java_major, ".")
-
-if (Sys.getenv("JAVA_HOME") == "") {
-  jp <- Sys.which("java")
-  if (nzchar(jp)) {
-    cand <- dirname(dirname(normalizePath(jp, winslash = "/")))
-    if (file.exists(file.path(cand, "release"))) { Sys.setenv(JAVA_HOME = cand); say("JAVA_HOME set to ", cand) }
-  }
-}
-
-inst <- spark_installed_versions()$spark
-if (!SPARK_VERSION %in% inst)
-  stop("Spark ", SPARK_VERSION, " is not installed. Installed: ", paste(inst, collapse = ", "))
-say("Spark ", SPARK_VERSION, " found.")
-
+# Windows: point Spark to the Hadoop files if they exist
 if (.Platform$OS.type == "windows") {
   hh <- Sys.getenv("HADOOP_HOME")
-  if (hh == "" && file.exists("C:/hadoop/bin/winutils.exe")) { hh <- "C:/hadoop"; Sys.setenv(HADOOP_HOME = hh) }
-  has_files <- hh != "" && file.exists(file.path(hh, "bin", "winutils.exe")) &&
-    file.exists(file.path(hh, "bin", "hadoop.dll"))
-  if (!has_files)
-    stop("winutils.exe and/or hadoop.dll not found (HADOOP_HOME = '", hh, "'). Put both in C:/hadoop/bin, restart R, rerun.")
-  Sys.setenv(PATH = paste(normalizePath(file.path(hh, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
-  say("HADOOP_HOME = ", hh)
+  if (hh == "" && dir.exists("C:/hadoop/bin")) { hh <- "C:/hadoop"; Sys.setenv(HADOOP_HOME = hh) }
+  if (hh != "") Sys.setenv(PATH = paste(normalizePath(file.path(hh, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
 }
 
 need_files <- paste0(c("audio_train", "audio_test", "lyrics_train", "lyrics_test",
                        "combined_train", "combined_test"), ".parquet")
 gone <- need_files[!file.exists(file.path(IN_DIR, need_files))]
 if (length(gone)) stop("Missing in ", IN_DIR, ": ", paste(gone, collapse = ", "),
-                       ". Run 05_features_split.R in the same mode first.")
+                       ". Run R/02_features.R in the same mode first.")
 say("All six input files found in ", IN_DIR)
-say("Check: these files must come from the version 3 run of 05 (look for 'Script version 3' in stage2_log.txt).")
 
+# Metrics function (confusion matrix, per-class precision/recall/F1, macro F1, accuracy)
+class_metrics <- function(actual, pred) {
+  cm <- table(factor(actual, levels = 0:5), factor(pred, levels = 0:5))
+  tp <- diag(cm); fn <- rowSums(cm) - tp; fp <- colSums(cm) - tp
+  prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  list(cm = cm, precision = unname(prec), recall = unname(rec), f1 = unname(f1),
+       macro_f1 = mean(f1), accuracy = sum(tp) / sum(cm))
+}
+
+inst <- tryCatch(spark_installed_versions()$spark, error = function(e) character(0))
+SPARK_VERSION <- if (PREFERRED_SPARK %in% inst) PREFERRED_SPARK else
+  if (length(inst)) tail(sort(inst), 1) else PREFERRED_SPARK
+
+tryCatch(spark_disconnect_all(), error = function(e) NULL)   # close old connections
 cfg <- spark_config()
 cfg$`sparklyr.shell.driver-memory` <- DRIVER_MEM
 cfg$sparklyr.cores.local           <- CORES
@@ -84,10 +92,10 @@ cfg$spark.sql.shuffle.partitions   <- 32
 cfg$spark.local.dir                <- file.path(WORK_ROOT, "spark_tmp")
 dir.create(cfg$spark.local.dir, recursive = TRUE, showWarnings = FALSE)
 sc <- spark_connect(master = "local", version = SPARK_VERSION, config = cfg)
-say("Spark connected. Driver memory ", DRIVER_MEM, ", cores ", CORES)
+say("Spark ", SPARK_VERSION, " connected. Driver memory ", DRIVER_MEM, ", cores ", CORES)
 
 # ---------------------------------------------------------------------
-# 2. READ THE FILES AND CHECK THEIR FORMAT
+# 2. READ FILES AND CHECK FORMAT
 # ---------------------------------------------------------------------
 hdr("STEP 2: read the six files")
 for (nm in sub("\\.parquet$", "", need_files)) {
@@ -102,27 +110,11 @@ for (nm in c("audio_train", "audio_test", "lyrics_train", "lyrics_test", "combin
   if (!all(need_cols %in% cc)) stop(nm, " lacks columns: ", paste(setdiff(need_cols, cc), collapse = ", "))
   if (grepl("_train$", nm) && !"weight" %in% cc) stop(nm, " has no weight column.")
 }
-if (RUN_ABLATION && !"features_11" %in% colnames(tbl(sc, "in_audio_train"))) {
-  say("features_11 not found in audio files, ablation skipped."); RUN_ABLATION <- FALSE
-}
 say("Format check: PASS (row_id, emotion, label, features; weight in train files)")
 
-maj <- sdf_sql(sc, "SELECT label, COUNT(*) AS n FROM in_audio_train GROUP BY label ORDER BY n DESC LIMIT 1") %>% collect()
-MAJ_LABEL <- as.integer(maj$label[1])
-say("Majority class in train: ", CLASSES[MAJ_LABEL + 1], " (label ", MAJ_LABEL, ")")
-
 # ---------------------------------------------------------------------
-# 3. METRIC HELPERS (Macro F1 gives every class equal weight)
+# 3. METRIC ROW HELPER
 # ---------------------------------------------------------------------
-class_metrics <- function(actual, pred) {
-  cm <- table(factor(actual, levels = 0:5), factor(pred, levels = 0:5))
-  tp <- diag(cm); fn <- rowSums(cm) - tp; fp <- colSums(cm) - tp
-  prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
-  rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
-  f1   <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
-  list(cm = cm, precision = unname(prec), recall = unname(rec), f1 = unname(f1),
-       macro_f1 = mean(f1), accuracy = sum(tp) / sum(cm))
-}
 metric_row <- function(set_name, mt, train_sec) {
   out <- data.frame(feature_set = set_name, macro_f1 = mt$macro_f1, accuracy = mt$accuracy,
                     train_seconds = train_sec, stringsAsFactors = FALSE)
@@ -133,29 +125,26 @@ metric_row <- function(set_name, mt, train_sec) {
 }
 
 # ---------------------------------------------------------------------
-# 4. TRAIN AND PREDICT (identical settings for every feature set)
+# 4. TRAIN AND PREDICT
 # ---------------------------------------------------------------------
 hdr(paste0("STEP 3: Naive Bayes (multinomial, smoothing = ", SMOOTHING, ", class weights from train)"))
 sets <- list(
-  audio    = list(tr = "in_audio_train",    te = "in_audio_test",    col = "features"),
-  lyrics   = list(tr = "in_lyrics_train",   te = "in_lyrics_test",   col = "features"),
-  combined = list(tr = "in_combined_train", te = "in_combined_test", col = "features"))
-if (RUN_ABLATION) sets$audio_11 <- list(tr = "in_audio_train", te = "in_audio_test", col = "features_11")
+  audio    = list(tr = "in_audio_train",    te = "in_audio_test"),
+  lyrics   = list(tr = "in_lyrics_train",   te = "in_lyrics_test"),
+  combined = list(tr = "in_combined_train", te = "in_combined_test"))
 
 res <- list(); preds <- list(); cms <- list()
 for (nm in names(sets)) {
   s <- sets[[nm]]
   say("\n--- ", nm, " ---")
-  tr <- sdf_sql(sc, sprintf("SELECT label, weight, %s AS features FROM %s", s$col, s$tr))
-  te <- sdf_sql(sc, sprintf("SELECT CAST(row_id AS STRING) AS row_id, emotion, label, %s AS features FROM %s", s$col, s$te))
+  tr <- sdf_sql(sc, sprintf("SELECT label, weight, features FROM %s", s$tr))
+  te <- sdf_sql(sc, sprintf("SELECT CAST(row_id AS STRING) AS row_id, emotion, label, features FROM %s", s$te))
   
   t0 <- Sys.time()
   model <- tryCatch(
     ml_naive_bayes(tr, model_type = "multinomial", smoothing = SMOOTHING, weight_col = "weight",
                    features_col = "features", label_col = "label"),
-    error = function(e) stop("Naive Bayes failed on '", nm, "'. If the message mentions negative values, ",
-                             "a feature is below 0 (Naive Bayes needs non-negative input). Original error: ",
-                             conditionMessage(e)))
+    error = function(e) stop("Naive Bayes failed on '", nm, "': ", conditionMessage(e)))
   train_sec <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
   say("Training time: ", train_sec, " seconds")
   
@@ -166,7 +155,7 @@ for (nm in names(sets)) {
   if (anyNA(p$prediction)) stop("Some predictions are NA for ", nm)
   
   mt <- class_metrics(p$label, p$prediction)
-  say("Macro F1 = ", round(mt$macro_f1, 4), " | accuracy = ", round(mt$accuracy, 4))
+  say("Macro F1 = ", pct(mt$macro_f1), " | accuracy = ", pct(mt$accuracy))
   say("Predicted class counts: ",
       paste(sprintf("%s=%d", CLASSES, as.integer(colSums(mt$cm))), collapse = ", "))
   say("Actual class counts   : ",
@@ -181,30 +170,24 @@ for (nm in names(sets)) {
   preds[[nm]] <- data.frame(row_id = p$row_id, emotion = p$emotion,
                             prediction = CLASSES[p$prediction + 1], feature_set = nm,
                             stringsAsFactors = FALSE)
-  if (nm == "audio") base_actual <- p$label     # same test rows in every set
 }
 
-# Majority-class baseline (predict the train majority class for every test row)
-mb <- class_metrics(base_actual, rep(MAJ_LABEL, length(base_actual)))
-res[["baseline_majority"]] <- metric_row("baseline_majority", mb, NA_real_)
-say("\nMajority-class baseline: Macro F1 = ", round(mb$macro_f1, 4), " | accuracy = ", round(mb$accuracy, 4))
-
 # ---------------------------------------------------------------------
-# 5. SAVE THE OUTPUTS
+# 5. SAVE OUTPUTS
 # ---------------------------------------------------------------------
 hdr("STEP 4: save outputs")
 metrics <- do.call(rbind, res)
-readr::write_csv(metrics, file.path(OUT_DIR, "nb_metrics.csv"))
-readr::write_csv(do.call(rbind, cms), file.path(OUT_DIR, "nb_confusion.csv"))
+readr::write_csv(metrics, file.path(RES_DIR, "nb_metrics.csv"))   # numbers 0-1
+# Same table as percent text, for the report
+metrics_pct <- metrics %>% mutate(across(-c(feature_set, train_seconds), pct))
+readr::write_csv(metrics_pct, file.path(RES_DIR, "nb_metrics_percent.csv"))
+readr::write_csv(do.call(rbind, cms), file.path(RES_DIR, "nb_confusion.csv"))
 
-main_sets <- intersect(c("audio", "lyrics", "combined"), names(preds))
-readr::write_csv(do.call(rbind, preds[main_sets]), file.path(OUT_DIR, "predictions_naive_bayes.csv"))
-if (RUN_ABLATION) readr::write_csv(preds[["audio_11"]], file.path(OUT_DIR, "predictions_naive_bayes_audio11.csv"))
-say("Saved: predictions_naive_bayes.csv, ",
-    if (RUN_ABLATION) "predictions_naive_bayes_audio11.csv, " else "",
-    "nb_metrics.csv, nb_confusion.csv in ", OUT_DIR)
-
+main_sets <- c("audio", "lyrics", "combined")
 pc <- do.call(rbind, preds[main_sets])
+readr::write_csv(pc, file.path(PRED_DIR, "predictions_naive_bayes.csv"))
+say("Saved: ", file.path(PRED_DIR, "predictions_naive_bayes.csv"))
+say("Saved: nb_metrics.csv, nb_confusion.csv, nb_log.txt in ", RES_DIR)
 say("predictions_naive_bayes.csv rows: ", format(nrow(pc), big.mark = ","),
     " (", length(main_sets), " feature sets x test rows); duplicate (row_id, feature_set) pairs: ",
     sum(duplicated(pc[, c("row_id", "feature_set")])))
@@ -212,14 +195,14 @@ say("predictions_naive_bayes.csv rows: ", format(nrow(pc), big.mark = ","),
 # ---------------------------------------------------------------------
 # 6. SUMMARY
 # ---------------------------------------------------------------------
-hdr(paste0("SUMMARY", if (PILOT) " (PILOT: do not report these scores)" else ""))
+hdr(paste0("SUMMARY", if (PILOT) " (PILOT: test run only)" else ""))
 say_df(metrics %>% select(feature_set, macro_f1, accuracy, train_seconds) %>%
-         mutate(across(c(macro_f1, accuracy), ~ round(.x, 4))))
-say("\nPer-class recall (which emotions are missed):")
+         mutate(across(c(macro_f1, accuracy), pct)))
+say("\nPer-class recall:")
 rc <- metrics %>% select(feature_set, starts_with("recall_"))
 names(rc) <- sub("^recall_", "", names(rc))
-say_df(rc %>% mutate(across(-feature_set, ~ round(.x, 3))))
+say_df(rc %>% mutate(across(-feature_set, pct)))
 say("\nElapsed: ", round(difftime(Sys.time(), T0, units = "mins"), 1), " minutes")
-say("Hand-off: send predictions_naive_bayes.csv to Xin Rou (Integration Lead).")
-say("Tell her to read row_id as TEXT (readr::cols(row_id = col_character())), because ids are large numbers.")
+say("Note: row_id is saved as text.")
+
 spark_disconnect(sc)
