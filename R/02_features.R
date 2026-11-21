@@ -33,8 +33,9 @@ DRIVER_MEM   <- "8G"     # memory for Spark
 CORES        <- 4        # CPU cores for Spark
 
 # Project root = working directory (or its parent if you are inside R/)
-PROJECT_ROOT <- normalizePath(getwd(), winslash = "/")
-if (basename(PROJECT_ROOT) == "R") PROJECT_ROOT <- dirname(PROJECT_ROOT)
+PROJECT_ROOT <- "C:/Users/USER/OneDrive - ums.edu.my/Desktop/BDA/BDA"
+if (!dir.exists(PROJECT_ROOT)) stop("PROJECT_ROOT does not exist: ", PROJECT_ROOT)
+setwd(PROJECT_ROOT)
 PROC_DIR     <- file.path(PROJECT_ROOT, "data", "processed")
 
 # Input file from 01_ingest.R
