@@ -1,395 +1,387 @@
 # 03_eda.R
 # Owner: Ong Chia Yin (Data Scientist)
 # Purpose: SQL queries, plots 1 to 3 and 6
-
-# Input   : data/processed/spotify_structured.sqlite  (from R/01_ingest.R)
-#           -> view `model_ready` (493,820 rows: no duplicates, 6 valid emotions)
-# Output  : outputs/plot1.png, plot2.png, plot3.png, plot6.png
-#           outputs/table1_*.csv ... table6_*.csv (summary tables for the report)
-#           outputs/eda_log.txt (row counts + session info)
-
-# AI-assisted (Claude), 18 Nov 2026
-
-# -----------------------------------------------------------------------------
-# 0. SETTINGS
-# -----------------------------------------------------------------------------
-
-# Path to the SQLite database (relative to the project root, see README "Data")
-db_path <- "data/processed/spotify_structured.sqlite"
-
-# Folder where plots and tables are saved (see README "Outputs")
-out_dir <- "outputs"
-
-# Audio features shown in Plot 3 (confirmed with the Spark Feature Engineer:
-# the same 9 features as the audio feature set used for modelling).
-audio_features <- c("energy", "valence", "danceability", "tempo", "loudness",
-                    "speechiness", "liveness", "acousticness", "instrumentalness")
-
-# Expected row count of model_ready view (from the Stage 1)
-expected_rows <- 493820
-
-# Size and sharpness of the saved pictures.
-plot_width  <- 8     # inches
-plot_height <- 5     # inches 
-plot_dpi    <- 300   # publication quality
+# AI-assisted (Claude), 2026-11-20
 
 
 # -----------------------------------------------------------------------------
-# SECTION 1 - LOAD THE PACKAGES
+# SECTION 1 - PACKAGES
 # -----------------------------------------------------------------------------
 
-# This section first checks they are installed then stops with a clear message 
-# if any are missing and prompt for user to install them
+# Install once in the Console if missing:
+# install.packages(c("DBI", "RSQLite", "ggplot2", "dplyr", "tidyr", "scales"))
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
 
-required_pkgs <- c("DBI", "RSQLite", "ggplot2", "dplyr", "tidyr", "scales")
-missing_pkgs  <- required_pkgs[!vapply(required_pkgs, requireNamespace,
-                                       logical(1), quietly = TRUE)]
-if (length(missing_pkgs) > 0) {
-  stop("Missing packages: ", paste(missing_pkgs, collapse = ", "),
-       "\nInstall them with: install.packages(c(\"",
-       paste(missing_pkgs, collapse = "\", \""), "\"))")
+
+# -----------------------------------------------------------------------------
+# SECTION 2 - FILE PATHS
+# -----------------------------------------------------------------------------
+
+# Path to the SQLite database
+db_path    <- "data/processed/spotify_structured.sqlite"
+
+# Get queries from SQL 
+sql_path   <- "sql/eda_queries.sql"
+
+# Folder where plots and tables are saved 
+output_dir <- "outputs"
+
+# Stop early with a helpful message instead of a confusing error later.
+if (!file.exists(db_path)) {
+  stop("Database not found at ", db_path,
+       ". Download spotify_structured.sqlite from the Google Drive link ",
+       "in the README and put it in data/processed/.")
+}
+if (!file.exists(sql_path)) {
+  stop("SQL file not found at ", sql_path, ". Make sure you opened the .Rproj file.")
+}
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 3 - LOAD THE SQL QUERIES
+# -----------------------------------------------------------------------------
+
+# Every query in eda_queries.sql starts with a "-- name: something" line.
+# This reads the file and keeps each query under its name, so the SQL
+# lives in one place only.
+read_queries <- function(path) {
+  lines  <- readLines(path, warn = FALSE)
+  starts <- grep("^--\\s*name:", lines)
+  ends   <- c(starts[-1] - 1, length(lines))
+  query_names <- trimws(sub("^--\\s*name:", "", lines[starts]))
+  query_text  <- mapply(function(s, e) {
+    block <- lines[(s + 1):e]
+    
+    # Drop comment lines, so notes and section dividers never reach SQLite.
+    block <- block[!grepl("^\\s*--", block)]
+    paste(block, collapse = "\n")
+  }, starts, ends)
+  setNames(trimws(query_text), query_names)
 }
 
-suppressPackageStartupMessages({
-  library(DBI)
-  library(RSQLite)
-  library(ggplot2)
-  library(dplyr)
-  library(tidyr)
-  library(scales)
-})
+queries <- read_queries(sql_path)
+
+# Run a query by its name and get the result back as a data frame.
+run_sql <- function(name) {
+  if (!name %in% names(queries)) {
+    stop("No query called '", name, "' in ", sql_path)
+  }
+  dbGetQuery(con, queries[[name]])
+}
 
 
 # -----------------------------------------------------------------------------
-# SECTION 2 - COLOURS AND PLOT STYLE (SHARED BY EVERY PLOT)
+# SECTION 4 - CONNECT TO THE DATABASE
 # -----------------------------------------------------------------------------
 
-# Fixed order used on every x-axis (largest class to smallest)
-emotion_levels <- c("joy", "sadness", "anger", "fear", "love", "surprise")
+# Read-only, so nothing in this script can change the shared database.
+con <- dbConnect(RSQLite::SQLite(), db_path, flags = RSQLite::SQLITE_RO)
+cat("Connected. Tables and views:", paste(dbListTables(con), collapse = ", "), "\n")
 
-# One colour per emotion. Emotion names are always shown on the axis as a second cue.
-emotion_cols <- c(
-  joy      = "#eda100",  # yellow
-  sadness  = "#2a78d6",  # blue
-  anger    = "#e34948",  # red
-  fear     = "#6250d6",  # violet
-  love     = "#e87ba4",  # pink
-  surprise = "#1baf7a"   # green
+
+# -----------------------------------------------------------------------------
+# SECTION 5 - CHECK WE HAVE THE RIGHT VERSION OF THE DATA
+# -----------------------------------------------------------------------------
+
+# Confirm the database matches the cleaned Stage 1 data described in the
+# report before any plot is made: 551,443 songs, of which 492,943 are in
+# the model_ready view used for this EDA. Stop if anything differs.
+expected_songs       <- 551443
+expected_model_ready <- 492943
+
+n_songs       <- run_sql("count_songs")$n
+n_model_ready <- run_sql("count_model_ready")$n
+n_use_flag    <- run_sql("count_use_for_model")$n
+
+check <- function(ok, message) {
+  if (!ok) stop("Data check failed: ", message, call. = FALSE)
+  cat("OK  -", message, "\n")
+}
+
+check(n_songs == expected_songs,
+      paste0("songs has ", format(n_songs, big.mark = ","), " rows"))
+check(n_model_ready == expected_model_ready,
+      paste0("model_ready has ", format(n_model_ready, big.mark = ","), " rows"))
+check(n_use_flag == n_model_ready,
+      "use_for_model = 1 marks the same rows as the model_ready view")
+
+# Emotion counts: should be six classes, from joy (largest) to surprise.
+emotion_counts <- run_sql("emotion_counts")
+check(nrow(emotion_counts) == 6, "model_ready has exactly 6 emotion classes")
+print(emotion_counts)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 6 - SHARED PLOT STYLE
+# -----------------------------------------------------------------------------
+
+# One look for every EDA plot, so they sit together nicely in the report
+# and dashboard.
+
+# Each emotion keeps the same colour in every plot, so a reader can follow
+# one emotion across the dashboard. Emotion names always stay on the axis
+# too, so the meaning never depends on colour alone (colour-blind safe).
+
+emotion_colours <- c(
+  joy      = "#eda100",   # yellow
+  sadness  = "#2a78d6",   # blue
+  anger    = "#e34948",   # red
+  fear     = "#6250d6",   # violet
+  love     = "#e87ba4",   # pink
+  surprise = "#1baf7a"    # aqua
 )
 
-ink_primary   <- "#0b0b0b"   # main text
-ink_secondary <- "#52514e"   # axis text, captions
-grid_col      <- "#e6e5e1"   # light gridlines
-
-theme_bda <- function(base_size = 12) {
-  theme_minimal(base_size = base_size) +
+theme_eda <- function() {
+  theme_minimal(base_size = 12) +
     theme(
+      plot.title          = element_text(face = "bold", size = 14, colour = "#0b0b0b"),
+      plot.subtitle       = element_text(colour = "#52514e", margin = margin(b = 10)),
       plot.title.position = "plot",
-      plot.caption.position = "plot",
-      plot.title    = element_text(face = "bold", colour = ink_primary,
-                                   size = rel(1.15)),
-      plot.subtitle = element_text(colour = ink_secondary,
-                                   margin = margin(b = 10)),
-      plot.caption  = element_text(colour = ink_secondary, size = rel(0.8),
-                                   hjust = 0, margin = margin(t = 10)),
-      axis.title    = element_text(colour = ink_secondary),
-      axis.text     = element_text(colour = ink_secondary),
-      panel.grid.major.x = element_blank(),
-      panel.grid.minor   = element_blank(),
-      panel.grid.major.y = element_line(colour = grid_col, linewidth = 0.4),
-      legend.position = "none",
-      plot.background = element_rect(fill = "white", colour = NA),
-      plot.margin = margin(12, 16, 12, 12)
+      axis.title          = element_text(colour = "#52514e"),
+      axis.text           = element_text(colour = "#0b0b0b"),
+      panel.grid.minor    = element_blank(),
+      panel.grid.major    = element_line(colour = "#e6e5e1", linewidth = 0.3),
+      legend.position     = "none",   # emotion names are on the axis already
+      plot.margin         = margin(12, 16, 12, 12)
     )
 }
 
-# Helper: save a plot with the standard size and report where it went
-save_plot <- function(plot, file_name, width = plot_width,
-                      height = plot_height) {
-  path <- file.path(out_dir, file_name)
-  ggsave(path, plot, width = width, height = height, dpi = plot_dpi,
-         bg = "white")
-  log_msg("Saved ", path)
-}
 
-# Helper: save a table as CSV
-save_table <- function(df, file_name) {
-  path <- file.path(out_dir, file_name)
-  write.csv(df, path, row.names = FALSE)
-  log_msg("Saved ", path)
-}
+# -----------------------------------------------------------------------------
+# SECTION 7 - PLOT 1: EMOTION DISTRIBUTIONS
+# -----------------------------------------------------------------------------
+
+# Check distribution of classes. 
+# Decide class weights.
+# Prove why Macro F1 is fairest metrics.
+
+write.csv(emotion_counts, file.path(output_dir, "eda_emotion_counts.csv"), row.names = FALSE)
+
+plot1_data <- emotion_counts %>%
+  mutate(
+    label   = paste0(comma(n), "  (", sprintf("%.1f", pct), "%)"),   # always 1 decimal
+    emotion = reorder(emotion, n)   # largest bar at the top
+  )
+
+plot1 <- ggplot(plot1_data, aes(x = n, y = emotion, fill = emotion)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = label), hjust = -0.08, size = 3.6, colour = "#0b0b0b") +
+  scale_fill_manual(values = emotion_colours) +
+  scale_x_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.25))   # room on the right for the labels
+  ) +
+  labs(
+    title    = "Emotion labels are highly imbalanced, from 38% joy to 1% surprise",
+    subtitle = paste0("Number of songs per emotion label (n = ",
+                      comma(sum(emotion_counts$n)), ")"),
+    x        = "Number of songs",
+    y        = NULL
+  ) +
+  theme_eda() +
+  theme(panel.grid.major.y = element_blank())   # bars don't need horizontal lines
+
+ggsave(file.path(output_dir, "plot1_emotion_distribution.png"),
+       plot1, width = 9, height = 5, dpi = 300, bg = "white")
+cat("Saved plot1_emotion_distribution.png\n")
 
 
 # -----------------------------------------------------------------------------
-# SECTION 3 - SET UP OUTPUT FOLDER AND LOG
+# SECTION 8 - PLOT 2: VALANCE BY EMOTION
 # -----------------------------------------------------------------------------
 
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-log_file <- file.path(out_dir, "eda_log.txt")
-cat("EDA log -", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n",
-    file = log_file)
+# Valence = how positive a song sounds (0 = sad/tense, 1 = happy).
+# Plot 2 checks whether it differs between the emotions.
+audio_means <- run_sql("audio_means_by_emotion")
+write.csv(audio_means, file.path(output_dir, "eda_audio_means_by_emotion.csv"), row.names = FALSE)
+print(audio_means[, c("emotion", "n", "valence", "energy", "danceability")])
 
-# Print a message to the console AND append it to the log file
-log_msg <- function(...) {
-  msg <- paste0(...)
-  message(msg)
-  cat(msg, "\n", file = log_file, append = TRUE)
-}
+valence_data <- run_sql("valence_by_emotion") %>%
+  mutate(emotion = factor(emotion, levels = rev(emotion_counts$emotion)))
+
+# Medians are hard to read off the axis when they are this close, so we
+# print each one just above its box. SQLite has no MEDIAN(), so it's done in R.
+valence_medians <- valence_data %>%
+  group_by(emotion) %>%
+  summarise(median = median(valence), .groups = "drop")
+
+plot2 <- ggplot(valence_data, aes(x = valence, y = emotion, fill = emotion)) +
+
+  geom_boxplot(width = 0.5, colour = "#52514e", linewidth = 0.4,
+               outlier.size = 0.4, outlier.alpha = 0.3) +
+  geom_text(data = valence_medians,
+            
+            # 2 decimals: valence is stored to 2 decimals
+            aes(x = median, y = emotion, label = sprintf("%.2f", median)),
+            nudge_y = 0.38, size = 3.3, colour = "#0b0b0b", inherit.aes = FALSE) +
+  scale_fill_manual(values = emotion_colours) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    title    = "Emotions overlap heavily in valence; medians range only from 0.41 (sadness) to 0.49 (joy)",
+    subtitle = paste0("Valence per emotion label (n = ",
+                      comma(nrow(valence_data)), "); labels show medians"),
+    x        = "Valence (0 = negative-sounding, 1 = positive-sounding)",
+    y        = NULL
+  ) +
+  theme_eda() +
+  theme(panel.grid.major.y = element_blank())
+
+ggsave(file.path(output_dir, "plot2_valence_by_emotion.png"),
+       plot2, width = 9, height = 5, dpi = 300, bg = "white")
+cat("Saved plot2_valence_by_emotion.png\n")
 
 
 # -----------------------------------------------------------------------------
-# SECTION 4 - CONNECT TO SQLITE (read-only) AND CHECK THE DATA
+# SECTION 9 - PLOT 3: CORRELATIONS BETWEEN AUDIO FEATURES
 # -----------------------------------------------------------------------------
 
-if (!file.exists(db_path)) {
-  stop("Database not found at: ", db_path,
-       "\nCheck db_path in Section 0 of this script.")
-}
+# Plot 3: correlations between the 9 audio features used in the models,
+# to see which features overlap.
+audio_features <- run_sql("audio_features")
 
-con <- tryCatch(
-  dbConnect(RSQLite::SQLite(), db_path, flags = SQLITE_RO),
-  error = function(e) stop("Could not open the database: ", conditionMessage(e))
+# Pearson correlation (the standard measure of linear relationship).
+cor_matrix <- cor(audio_features, method = "pearson")
+write.csv(round(cor_matrix, 3), file.path(output_dir, "eda_audio_correlations.csv"))
+
+# Readable names for the axes, in the same order as the SQL query.
+feature_labels <- c(
+  energy = "Energy", loudness = "Loudness", acousticness = "Acousticness",
+  valence = "Valence", danceability = "Danceability", tempo = "Tempo",
+  speechiness = "Speechiness", liveness = "Liveness",
+  instrumentalness = "Instrumentalness"
 )
 
-if (!"model_ready" %in% dbListTables(con)) {
-  stop("The view 'model_ready' is missing. Re-run R/01_ingest.R")
-}
+# Keep only the lower triangle (the upper half repeats it; the diagonal is always 1).
+cor_long <- as.data.frame(as.table(cor_matrix)) %>%
+  rename(row_feature = Var1, col_feature = Var2, r = Freq) %>%
+  filter(match(row_feature, colnames(cor_matrix)) > match(col_feature, colnames(cor_matrix))) %>%
+  mutate(
+    col_feature  = factor(feature_labels[as.character(col_feature)], levels = feature_labels),
+    row_feature  = factor(feature_labels[as.character(row_feature)], levels = rev(feature_labels)),
+    label_colour = ifelse(abs(r) >= 0.5, "white", "#0b0b0b")   # keep text readable on dark cells
+  )
 
-n_rows <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM model_ready")$n
-log_msg("model_ready rows: ", format(n_rows, big.mark = ","))
-if (n_rows != expected_rows) {
-  warning("model_ready has ", n_rows, " rows; expected ", expected_rows,
-          ". The database may have been rebuilt - check with the Data Engineer.")
-}
-
-found_emotions <- dbGetQuery(con, "SELECT DISTINCT emotion FROM model_ready")$emotion
-if (!setequal(found_emotions, emotion_levels)) {
-  stop("Unexpected emotion labels: ",
-       paste(setdiff(found_emotions, emotion_levels), collapse = ", "))
-}
-
-
-
-# -----------------------------------------------------------------------------
-# SECTION 5 - PLOT 1: Emotion class distribution
-# (To find out whether six emotion classes are balanced)
-# -----------------------------------------------------------------------------
-
-# Step 1: SQL counts the songs in each emotion (GROUP BY).
-emotion_counts <- dbGetQuery(con, "
-  SELECT emotion, COUNT(*) AS n_songs
-  FROM model_ready
-  GROUP BY emotion
-") |>
-  # Step 2: R adds the percentage and saves the table.
-  mutate(pct     = n_songs / sum(n_songs),
-         emotion = factor(emotion, levels = emotion_levels)) |>
-  arrange(emotion)
-
-
-save_table(emotion_counts |> mutate(pct = round(pct * 100, 2)),
-           "table1_emotion_counts.csv")
-
-# Step 3: Draw a bar chart with the count and % above each bar.
-plot1 <- ggplot(emotion_counts, aes(x = emotion, y = n_songs, fill = emotion)) +
-  geom_col(width = 0.62) +
-  geom_text(aes(label = paste0(comma(n_songs), "\n(",
-                               percent(pct, accuracy = 0.1), ")")),
-            vjust = -0.25, size = 3.5, colour = ink_primary, lineheight = 0.9) +
-  scale_fill_manual(values = emotion_cols) +
-  scale_y_continuous(labels = label_comma(),
-                     expand = expansion(mult = c(0, 0.15))) +
-  labs(title    = "Plot 1: Joy, sadness and anger dominate the emotion distribution",
-       subtitle = "Number of songs per emotion label",
-       x = "Emotion", y = "Number of songs") +
-  theme_bda()
-
-save_plot(plot1, "plot1.png") # Output: plot1.png, table1_emotion_counts.csv
-
-
-# -----------------------------------------------------------------------------
-# SECTION 6 - PLOT 2: Valence by emotion
-# To find out does audio "positiveness" (valence) differ between emotions
-# -----------------------------------------------------------------------------
-
-# Step 1: SQL works out the count, mean, min and max for each emotion.
-valence_sql <- dbGetQuery(con, "
-  SELECT emotion,
-         COUNT(*)     AS n_songs,
-         AVG(valence) AS mean_valence,
-         MIN(valence) AS min_valence,
-         MAX(valence) AS max_valence
-  FROM model_ready
-  GROUP BY emotion
-")
-
-# Step 2: R works out the median and quartiles (SQLite has no MEDIAN function).
-valence_df <- dbGetQuery(con, "SELECT emotion, valence FROM model_ready") |>
-  mutate(emotion = factor(emotion, levels = emotion_levels))
-
-valence_quart <- valence_df |>
-  group_by(emotion) |>
-  summarise(q1_valence     = quantile(valence, 0.25),
-            median_valence = median(valence),
-            q3_valence     = quantile(valence, 0.75),
-            .groups = "drop") |>
-  mutate(emotion = as.character(emotion))
-
-# Step 3: Join both into one table and save it.
-valence_summary <- valence_sql |>
-  left_join(valence_quart, by = "emotion") |>
-  mutate(emotion = factor(emotion, levels = emotion_levels)) |>
-  arrange(emotion) |>
-  mutate(across(where(is.numeric) & !n_songs, ~ round(.x, 2)))
-
-save_table(valence_summary, "table2_valence_by_emotion.csv")
-
-# Step 4: Draw a boxplot, with the median written beside each box.
-plot2 <- ggplot(valence_df, aes(x = emotion, y = valence, fill = emotion)) +
-  geom_boxplot(width = 0.6, outlier.shape = NA, colour = ink_secondary,
-               linewidth = 0.4) +
-  # Median value written beside each box
-  geom_text(data = valence_quart |>
-              mutate(emotion = factor(emotion, levels = emotion_levels)),
-            aes(x = as.numeric(emotion) + 0.34, y = median_valence,
-                label = round(median_valence, 1)),
-            inherit.aes = FALSE, hjust = 0, size = 3.5, colour = ink_primary) +
-  scale_fill_manual(values = emotion_cols) +
-  scale_y_continuous(breaks = seq(0, 100, 25)) +
-  coord_cartesian(ylim = c(0, 100)) +
-  labs(title    = "Plot 2: Musical valence distributions overlap across emotion classes",
-       subtitle = "Musical positiveness of the audio, 0 = negative, 100 = positive (number = median)",
-       x = "Emotion", y = "Valence (0-100)") +
-  theme_bda()
-
-save_plot(plot2, "plot2.png")     # Output: plot2.png, table2_valence_by_emotion.csv
-rm(valence_df); invisible(gc())   # free memory
-
-
-# -----------------------------------------------------------------------------
-# SECTION 7 - PLOT 3: Correlation between audio features
-# To find out which audio features move together (multicollinearity)
-# -----------------------------------------------------------------------------
-
-# Step 1: SQL fetches the 9 audio features for every song.
-audio_sql <- paste0("SELECT ", paste(audio_features, collapse = ", "),
-                    " FROM model_ready")
-audio_df <- dbGetQuery(con, audio_sql)
-
-# Step 2: R calculates the Spearman correlation between every pair.
-#         Spearman compares songs by their ranking, so it is not distorted by
-#         skewed features (speechiness, liveness, instrumentalness) or outliers.
-cor_mat <- cor(audio_df, method = "spearman")
-rm(audio_df); invisible(gc())
-
-save_table(data.frame(feature = rownames(cor_mat), round(cor_mat, 3),
-                      row.names = NULL),
-           "table3_audio_correlations.csv")
-
-# Step 3: keep only the lower triangle (the upper half is a mirror copy).
-cor_long <- as.data.frame(as.table(cor_mat)) |>
-  setNames(c("feature_x", "feature_y", "r")) |>
-  mutate(ix = match(feature_x, audio_features),
-         iy = match(feature_y, audio_features)) |>
-  filter(ix < iy) |>
-  mutate(feature_x = factor(feature_x, levels = audio_features),
-         feature_y = factor(feature_y, levels = rev(audio_features)))
-
-# Step 4: draw a heatmap - red = move together, blue = move in opposite directions.
-plot3 <- ggplot(cor_long, aes(x = feature_x, y = feature_y, fill = r)) +
-  geom_tile(colour = "white", linewidth = 1) +
-  geom_text(aes(label = sub("^-0\\.00$", "0.00", sprintf("%.2f", r)),
-                colour = abs(r) > 0.5),
-            size = 3.3, show.legend = FALSE) +
-  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = ink_primary)) +
-  scale_fill_gradient2(low = "#2a78d6", mid = "#f0efec", high = "#e34948",
+# Brown = negative, teal = positive, grey = no relationship. 
+# Blue/red is avoided on purpose: those colours already mean sadness/anger elsewhere.
+plot3 <- ggplot(cor_long, aes(x = col_feature, y = row_feature, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.2f", r), colour = label_colour), size = 3.1) +
+  scale_colour_identity() +
+  scale_fill_gradient2(low = "#8c510a", mid = "#f0efec", high = "#01665e",
                        midpoint = 0, limits = c(-1, 1),
-                       name = "Spearman r") +
-  labs(title    = "Plot 3: Energy is strongly associated with loudness and lower acousticness",
-       subtitle = "Spearman correlation between the 9 audio features",
-       x = NULL, y = NULL) +
-  theme_bda() +
-  theme(legend.position = "right",
-        panel.grid.major.y = element_blank(),
-        axis.text.x = element_text(angle = 40, hjust = 1))
+                       breaks = c(-1, -0.5, 0, 0.5, 1),
+                       name = "Correlation (r)") +
+  coord_fixed() +
+  labs(
+    title    = "Energy, loudness and acousticness are the only strongly related features",
+    subtitle = paste0("Pearson correlation of the 9 audio-model features (n = ",
+                      comma(nrow(audio_features)), ")"),
+    x = NULL, y = NULL
+  ) +
+  theme_eda() +
+  theme(
+    panel.grid.major = element_blank(),    # no gridlines behind the tiles
+    axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position  = "right",            # this plot needs its colour key
+    legend.title     = element_text(colour = "#52514e", size = 10),
+    legend.key.height = unit(1.2, "cm")
+  )
 
-save_plot(plot3, "plot3.png", width = 8, height = 6.5) # Output: plot3.png, table3_audio_correlations.csv
-
-
-# -----------------------------------------------------------------------------
-# SECTION 8 - PLOT 6: Similarity score by emotion
-# To find out whether songs of some emotions are more similar 
-# to their listed "similar songs" (semi-structured Similar Songs data)
-# -----------------------------------------------------------------------------
-
-zoom_min <- 0.90   # lower edge of the zoomed y-axis
-
-# Step 1: fetch every song's emotion and mean_similarity.
-sim_df <- dbGetQuery(con, "SELECT emotion, mean_similarity FROM model_ready") |>
-  mutate(emotion = factor(emotion, levels = emotion_levels))
-
-# Step 2: summarise each emotion (median, quartiles, outliers) and save it.
-sim_summary <- sim_df |>
-  group_by(emotion) |>
-  summarise(n_songs         = n(),
-            mean_sim        = mean(mean_similarity),
-            q1_sim          = quantile(mean_similarity, 0.25),
-            median_sim      = median(mean_similarity),
-            q3_sim          = quantile(mean_similarity, 0.75),
-            min_sim         = min(mean_similarity),
-            n_below_zoom    = sum(mean_similarity < zoom_min),
-            # Boxplot outliers: beyond 1.5 x IQR from the box edges
-            n_outliers      = sum(mean_similarity < q1_sim - 1.5 * (q3_sim - q1_sim) |
-                                    mean_similarity > q3_sim + 1.5 * (q3_sim - q1_sim)),
-            pct_outliers    = round(100 * n_outliers / n_songs, 2),
-            .groups = "drop") |>
-  mutate(across(c(mean_sim, q1_sim, median_sim, q3_sim, min_sim),
-                ~ round(.x, 4)))
-
-save_table(sim_summary, "table6_similarity_by_emotion.csv")
-
-n_below      <- sum(sim_summary$n_below_zoom)
-n_outliers   <- sum(sim_summary$n_outliers)
-pct_outliers <- 100 * n_outliers / n_rows
-log_msg("Plot 6 outliers: ", comma(n_outliers), " songs (",
-        round(pct_outliers, 1), "%), of which ", n_below, " are below ", zoom_min)
-
-# Step 3: draw a boxplot zoomed in to 0.90-1.00, because most songs score 
-#   above 0.95. On a 0-1 axis the boxes would be flat lines.
-plot6 <- ggplot(sim_df, aes(x = emotion, y = mean_similarity, fill = emotion)) +
-  # Outlier dots are not drawn: ~17,800 overlapping dots would form dark
-  # columns that draw the eye away from the boxes (stated in the caption)
-  geom_boxplot(width = 0.5, outlier.shape = NA, colour = ink_secondary,
-               linewidth = 0.4) +
-  # Median value written beside each box
-  geom_text(data = sim_summary,
-            aes(x = as.numeric(emotion) + 0.29, y = median_sim,
-                label = sprintf("%.3f", median_sim)),
-            inherit.aes = FALSE, hjust = 0, size = 3.3, colour = ink_primary) +
-  scale_fill_manual(values = emotion_cols) +
-  # Zoom like a camera: every song still counts in the box statistics
-  # clip = "off" lets the last median label sit outside the panel edge
-  coord_cartesian(ylim = c(zoom_min, 1.00), clip = "off") +
-  labs(title    = "Plot 6: Song similarity remains high across all emotion categories",
-       subtitle = "Average similarity to each song's 3 listed similar songs (number = median)",
-       x = "Emotion", y = "Mean similarity score (0-1)",
-       # Needed: the axis does not start at 0, so the reader must be told
-       caption = paste0("Y-axis starts at ", sprintf("%.2f", zoom_min),
-                        ". Outlier points (", comma(n_outliers), " songs, ",
-                        sprintf("%.1f", pct_outliers), "%) are not drawn; ",
-                        "all songs are counted in the boxes.")) +
-  theme_bda() +
-  theme(plot.margin = margin(12, 40, 12, 12))   # room for the last label
-
-save_plot(plot6, "plot6.png") # Output: plot6.png, table6_similarity_by_emotion.csv
-rm(sim_df); invisible(gc())
+ggsave(file.path(output_dir, "plot3_audio_correlations.png"),
+       plot3, width = 9, height = 7, dpi = 300, bg = "white")
+cat("Saved plot3_audio_correlations.png\n")
 
 
 # -----------------------------------------------------------------------------
-# SECTION 9 - FINISH: close connection, record session info
+# SECTION 10 - PLOT 6: SIMILAR-SONGS SCORE BY EMOTION
 # -----------------------------------------------------------------------------
 
-dbDisconnect(con)
-cat("\n--- sessionInfo() ---\n", file = log_file, append = TRUE)
-capture.output(sessionInfo(), file = log_file, append = TRUE)
-log_msg("EDA finished. Outputs are in: ", normalizePath(out_dir))
+# Plot 6: mean similarity score by emotion. The score comes from the
+# semi-structured "Similar Songs" field (nested JSON, flattened in Stage 1).
+similarity_summary <- run_sql("similarity_summary_by_emotion")
+write.csv(similarity_summary, file.path(output_dir, "eda_similarity_by_emotion.csv"), row.names = FALSE)
+print(similarity_summary)
+
+similarity_data <- run_sql("similarity_by_emotion") %>%
+  mutate(emotion = factor(emotion, levels = rev(emotion_counts$emotion)))   # same order as Plots 1-2
+
+# Almost every score is between 0.90 and 1, so the axis is zoomed in.
+# coord_cartesian() only zooms the view.
+# Every song still counts in the boxes, medians and outlier totals. 
+# Songs below 0.90 are noted in the caption.
+zoom_min  <- 0.90
+n_below   <- sum(similarity_summary$below_090)
+
+# Work out each emotion's median and outlier limit (Q1 - 1.5 x IQR),
+# to label the medians and count the outliers.
+similarity_stats <- similarity_data %>%
+  group_by(emotion) %>%
+  summarise(
+    median = median(mean_similarity),
+    q1     = quantile(mean_similarity, 0.25),
+    q3     = quantile(mean_similarity, 0.75),
+    n      = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(lower_limit = q1 - 1.5 * (q3 - q1))
+
+outlier_counts <- similarity_data %>%
+  inner_join(similarity_stats, by = "emotion") %>%
+  group_by(emotion) %>%
+  summarise(n_outliers = sum(mean_similarity < lower_limit),
+            n_hidden   = sum(mean_similarity < zoom_min),   # too low to draw on this axis
+            n          = first(n), .groups = "drop") %>%
+  mutate(label = paste0(comma(n_outliers), " outliers (",
+                        sprintf("%.1f", 100 * n_outliers / n), "%)",
+                        # Say how many of them are off the chart, if any.
+                        ifelse(n_hidden > 0,
+                               paste0(", incl. ", comma(n_hidden), " below ",
+                                      sprintf("%.2f", zoom_min), " not shown"),
+                               "")))
+print(outlier_counts)
+
+plot6 <- ggplot(similarity_data, aes(x = mean_similarity, y = emotion, fill = emotion)) +
+  # Outliers drawn small and faint grey, so thousands of them don't merge
+  # into a solid black bar. Same grey for every emotion.
+  geom_boxplot(width = 0.5, colour = "#52514e", linewidth = 0.4,
+               outlier.colour = "#52514e", outlier.size = 0.9,
+               outlier.alpha = 0.15, outlier.stroke = 0) +
+  # 3 decimals here.
+  # Scores are stored with full precision and the differences between emotions are small.
+  geom_text(data = similarity_stats,
+            aes(x = median, y = emotion, label = sprintf("%.3f", median)),
+            nudge_y = 0.38, size = 3.3, colour = "#0b0b0b", inherit.aes = FALSE) +
+  
+  # Check left edge emotion outlier.
+  geom_text(data = outlier_counts,
+            aes(x = zoom_min, y = emotion, label = label),
+            nudge_y = 0.38, hjust = 0, size = 3, colour = "#52514e", inherit.aes = FALSE) +
+  scale_fill_manual(values = emotion_colours) +
+  scale_x_continuous(breaks = seq(zoom_min, 1, 0.02),
+                     expand = expansion(mult = c(0, 0.01))) +   # start exactly at 0.90
+  coord_cartesian(xlim = c(zoom_min, 1)) +
+  labs(
+    title    = "Similarity is high for every emotion, but highest and most consistent for surprise",
+    subtitle = paste0("Mean similarity per emotion label (n = ",
+                      comma(nrow(similarity_data)), "); labels show medians"),
+    x        = "Mean similarity score of the 3 similar songs (0-1)",
+    y        = NULL,
+    caption  = paste0("Grey dots = outliers (below Q1 - 1.5 x IQR). Axis starts at ", sprintf("%.2f", zoom_min), ":\n",
+                      comma(n_below), " songs below it are off the chart but counted in the boxes and outlier totals.")
+  ) +
+  theme_eda() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.caption       = element_text(colour = "#52514e", size = 9, hjust = 0),
+    plot.caption.position = "plot"
+  )
+
+ggsave(file.path(output_dir, "plot6_similarity_by_emotion.png"),
+       plot6, width = 9, height = 5, dpi = 300, bg = "white")
+cat("Saved plot6_similarity_by_emotion.png\n")
