@@ -143,8 +143,12 @@ theme_eda <- function() {
       plot.title          = element_text(face = "bold", size = 14, colour = "#0b0b0b"),
       plot.subtitle       = element_text(colour = "#52514e", margin = margin(b = 10)),
       plot.title.position = "plot",
-      axis.title          = element_text(colour = "#52514e"),
-      axis.text           = element_text(colour = "#0b0b0b"),
+      axis.title          = element_text(colour = "#52514e", size = 12),
+      axis.title.x        = element_text(margin = margin(t = 8)),   # gap between axis title and numbers
+      axis.title.y        = element_text(margin = margin(r = 8)),
+      axis.text           = element_text(colour = "#0b0b0b", size = 12),
+      legend.title        = element_text(colour = "#52514e", size = 12),
+      legend.text         = element_text(size = 10),
       panel.grid.minor    = element_blank(),
       panel.grid.major    = element_line(colour = "#e6e5e1", linewidth = 0.3),
       legend.position     = "none",   # emotion names are on the axis already
@@ -159,7 +163,7 @@ theme_eda <- function() {
 
 # Check distribution of classes. 
 # Decide class weights.
-# Prove why Macro F1 is fairest metrics.
+# Show why Macro F1 is fairest metrics.
 
 write.csv(emotion_counts, file.path(output_dir, "eda_emotion_counts.csv"), row.names = FALSE)
 
@@ -171,7 +175,7 @@ plot1_data <- emotion_counts %>%
 
 plot1 <- ggplot(plot1_data, aes(x = n, y = emotion, fill = emotion)) +
   geom_col(width = 0.6) +
-  geom_text(aes(label = label), hjust = -0.08, size = 3.6, colour = "#0b0b0b") +
+  geom_text(aes(label = label), hjust = -0.08, size = 4.2, colour = "#0b0b0b") +
   scale_fill_manual(values = emotion_colours) +
   scale_x_continuous(
     labels = comma,
@@ -179,8 +183,7 @@ plot1 <- ggplot(plot1_data, aes(x = n, y = emotion, fill = emotion)) +
   ) +
   labs(
     title    = "Emotion labels are highly imbalanced, from 38% joy to 1% surprise",
-    subtitle = paste0("Number of songs per emotion label (n = ",
-                      comma(sum(emotion_counts$n)), ")"),
+    subtitle = "Number of songs per emotion label. Labels = count (share).",
     x        = "Number of songs",
     y        = NULL
   ) +
@@ -193,7 +196,7 @@ cat("Saved plot1_emotion_distribution.png\n")
 
 
 # -----------------------------------------------------------------------------
-# SECTION 8 - PLOT 2: VALANCE BY EMOTION
+# SECTION 8 - PLOT 2: VALENCE BY EMOTION
 # -----------------------------------------------------------------------------
 
 # Valence = how positive a song sounds (0 = sad/tense, 1 = happy).
@@ -219,13 +222,12 @@ plot2 <- ggplot(valence_data, aes(x = valence, y = emotion, fill = emotion)) +
             
             # 2 decimals: valence is stored to 2 decimals
             aes(x = median, y = emotion, label = sprintf("%.2f", median)),
-            nudge_y = 0.38, size = 3.3, colour = "#0b0b0b", inherit.aes = FALSE) +
+            nudge_y = 0.43, size = 4.2, colour = "#0b0b0b", inherit.aes = FALSE) +
   scale_fill_manual(values = emotion_colours) +
   scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
   labs(
     title    = "Emotions overlap heavily in valence; medians range only from 0.41 (sadness) to 0.49 (joy)",
-    subtitle = paste0("Valence per emotion label (n = ",
-                      comma(nrow(valence_data)), "); labels show medians"),
+    subtitle = "Valence per emotion label. Labels = medians.",
     x        = "Valence (0 = negative-sounding, 1 = positive-sounding)",
     y        = NULL
   ) +
@@ -280,8 +282,7 @@ plot3 <- ggplot(cor_long, aes(x = col_feature, y = row_feature, fill = r)) +
   coord_fixed() +
   labs(
     title    = "Energy, loudness and acousticness are the only strongly related features",
-    subtitle = paste0("Pearson correlation of the 9 audio-model features (n = ",
-                      comma(nrow(audio_features)), ")"),
+    subtitle = "Pearson correlation of the 9 audio-model features.",
     x = NULL, y = NULL
   ) +
   theme_eda() +
@@ -335,15 +336,9 @@ outlier_counts <- similarity_data %>%
   inner_join(similarity_stats, by = "emotion") %>%
   group_by(emotion) %>%
   summarise(n_outliers = sum(mean_similarity < lower_limit),
-            n_hidden   = sum(mean_similarity < zoom_min),   # too low to draw on this axis
             n          = first(n), .groups = "drop") %>%
-  mutate(label = paste0(comma(n_outliers), " outliers (",
-                        sprintf("%.1f", 100 * n_outliers / n), "%)",
-                        # Say how many of them are off the chart, if any.
-                        ifelse(n_hidden > 0,
-                               paste0(", incl. ", comma(n_hidden), " below ",
-                                      sprintf("%.2f", zoom_min), " not shown"),
-                               "")))
+  mutate(label = paste0(comma(n_outliers), " (",
+                        sprintf("%.1f", 100 * n_outliers / n), "%)"))
 print(outlier_counts)
 
 plot6 <- ggplot(similarity_data, aes(x = mean_similarity, y = emotion, fill = emotion)) +
@@ -356,29 +351,29 @@ plot6 <- ggplot(similarity_data, aes(x = mean_similarity, y = emotion, fill = em
   # Scores are stored with full precision and the differences between emotions are small.
   geom_text(data = similarity_stats,
             aes(x = median, y = emotion, label = sprintf("%.3f", median)),
-            nudge_y = 0.38, size = 3.3, colour = "#0b0b0b", inherit.aes = FALSE) +
+            nudge_y = 0.43, size = 4.2, colour = "#0b0b0b", inherit.aes = FALSE) +
   
-  # Check left edge emotion outlier.
+  # Check outlier count and share for each emotion, at the left edge
   geom_text(data = outlier_counts,
             aes(x = zoom_min, y = emotion, label = label),
-            nudge_y = 0.38, hjust = 0, size = 3, colour = "#52514e", inherit.aes = FALSE) +
+            nudge_x = 0.002, nudge_y = 0.38, hjust = 0, size = 3.0, colour = "#52514e", inherit.aes = FALSE) +
   scale_fill_manual(values = emotion_colours) +
   scale_x_continuous(breaks = seq(zoom_min, 1, 0.02),
                      expand = expansion(mult = c(0, 0.01))) +   # start exactly at 0.90
   coord_cartesian(xlim = c(zoom_min, 1)) +
   labs(
     title    = "Similarity is high for every emotion, but highest and most consistent for surprise",
-    subtitle = paste0("Mean similarity per emotion label (n = ",
-                      comma(nrow(similarity_data)), "); labels show medians"),
+    subtitle = "Mean similarity per emotion label. Labels = medians.",
     x        = "Mean similarity score of the 3 similar songs (0-1)",
     y        = NULL,
-    caption  = paste0("Grey dots = outliers (below Q1 - 1.5 x IQR). Axis starts at ", sprintf("%.2f", zoom_min), ":\n",
-                      comma(n_below), " songs below it are off the chart but counted in the boxes and outlier totals.")
+    caption  = paste0("Grey dots and counts = outliers (below Q1 - 1.5 x IQR). ",
+                      comma(n_below), " songs below ", sprintf("%.2f", zoom_min),
+                      " are off the axis but still counted.")
   ) +
   theme_eda() +
   theme(
     panel.grid.major.y = element_blank(),
-    plot.caption       = element_text(colour = "#52514e", size = 9, hjust = 0),
+    plot.caption       = element_text(colour = "#52514e", size = 10, hjust = 0),
     plot.caption.position = "plot"
   )
 
