@@ -139,18 +139,35 @@ read_train_labels <- function(path = file.path("data", "processed", "audio_train
   if (!requireNamespace("sparklyr", quietly = TRUE)) stop("package `sparklyr` is required")
 
   Sys.setenv(SPARK_LOCAL_IP = "127.0.0.1")
-  hadoop_home <- file.path(
-    sparklyr::spark_install_dir(),
-    paste0("spark-", spark_version, "-bin-hadoop3"), "tmp", "hadoop"
-  )
   java_opts <- ""
-  if (dir.exists(hadoop_home)) {
-    Sys.setenv(HADOOP_HOME = hadoop_home)
-    Sys.setenv(PATH = paste(file.path(hadoop_home, "bin"), Sys.getenv("PATH"), sep = ";"))
-    java_opts <- paste0(
-      "-Dhadoop.home.dir=", hadoop_home,
-      " -Djava.library.path=", file.path(hadoop_home, "bin")
-    )
+  hadoop_home <- ""
+  if (.Platform$OS.type == "windows") {
+    candidates <- unique(c(
+      Sys.getenv("HADOOP_HOME", unset = ""),
+      file.path(sparklyr::spark_install_dir(),
+                paste0("spark-", spark_version, "-bin-hadoop3"), "tmp", "hadoop"),
+      "C:/hadoop"
+    ))
+    candidates <- candidates[nzchar(candidates)]
+    for (cand in candidates) {
+      if (file.exists(file.path(cand, "bin", "winutils.exe"))) {
+        hadoop_home <- normalizePath(cand, winslash = "/", mustWork = FALSE)
+        break
+      }
+    }
+    if (nzchar(hadoop_home)) {
+      Sys.setenv(HADOOP_HOME = hadoop_home)
+      Sys.setenv(PATH = paste(normalizePath(file.path(hadoop_home, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
+      java_opts <- paste0(
+        "-Dhadoop.home.dir=", hadoop_home,
+        " -Djava.library.path=", file.path(hadoop_home, "bin")
+      )
+    } else {
+      warning(
+        "Windows Hadoop native files not found. If Spark fails, install winutils.exe in C:/hadoop/bin or set HADOOP_HOME.",
+        call. = FALSE
+      )
+    }
   }
 
   sc <- sparklyr::spark_connect(

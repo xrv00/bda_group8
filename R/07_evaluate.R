@@ -5,16 +5,18 @@
 #           implementation, compare against a majority-class baseline, and
 #           export metrics tables plus two PNG plots.
 #
-# Inputs:   output/predictions_naive_bayes.csv
-#           output/predictions_logistic_regression.csv
-#           output/predictions_random_forest.csv
+# Inputs:   outputs/predictions_naive_bayes.csv
+#           outputs/predictions_logistic_regression.csv
+#           outputs/predictions_random_forest.csv
 #           data/processed/audio_train.parquet  (emotion column, baseline only)
 #           R/eval_utils.R
 #
-# Outputs:  output/metrics_summary.csv
-#           output/metrics_per_class.csv
-#           output/plot4_confusion.png
-#           output/plot5_macro_f1.png
+# Outputs:  outputs/metrics_summary.csv
+#           outputs/metrics_per_class.csv
+#           outputs/plot4_confusion.png
+#           outputs/plot4b_confusion_by_featureset.png
+#           outputs/plot4_confusion_all.png
+#           outputs/plot5_macro_f1.png
 #
 # Notes:    The first two prediction files use the columns
 #           row_id, emotion, prediction, feature_set. `normalise_predictions()`
@@ -22,6 +24,7 @@
 #           row_id is read as character because it is a 64-bit Spark Long.
 #
 # AI-assisted (claude), 2026-11-24
+# AI-assisted (opencode), 2026-11-27
 # ==============================================================================
 
 suppressPackageStartupMessages({
@@ -29,15 +32,38 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(tibble)
   library(ggplot2)
+  library(scales)
 })
 
 source("R/eval_utils.R")
 
 # ------------------------------------------------------------------------------
+# Same text style as the EDA plots in R/03_eda.R, so all dashboard plots match
+# ------------------------------------------------------------------------------
+theme_eda <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title          = element_text(face = "bold", size = 14, colour = "#0b0b0b"),
+      plot.subtitle       = element_text(colour = "#52514e", margin = margin(b = 10)),
+      plot.title.position = "plot",
+      axis.title          = element_text(colour = "#52514e", size = 12),
+      axis.title.x        = element_text(margin = margin(t = 8)),
+      axis.title.y        = element_text(margin = margin(r = 8)),
+      axis.text           = element_text(colour = "#0b0b0b", size = 12),
+      legend.title        = element_text(colour = "#52514e", size = 12),
+      legend.text         = element_text(size = 12),
+      panel.grid.minor    = element_blank(),
+      panel.grid.major    = element_line(colour = "#e6e5e1", linewidth = 0.3),
+      legend.position     = "none",
+      plot.margin         = margin(12, 16, 12, 12)
+    )
+}
+
+# ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
 
-OUT_DIR <- "output"
+OUT_DIR <- "outputs"
 DATA_DIR <- file.path("data", "processed")
 
 CLASSES <- c("anger", "fear", "joy", "love", "sadness", "surprise")
@@ -49,6 +75,12 @@ MODEL_FILES <- c(
   logistic_regression = "predictions_logistic_regression.csv",
   random_forest = "predictions_random_forest.csv"
 )
+
+# Plot sizes for easy teammate adjustment
+PLOT4_SIZE     <- c(width = 6.2, height = 5.4)
+PLOT4B_SIZE    <- c(width = 14, height = 5.5)
+PLOT4_ALL_SIZE <- c(width = 16, height = 12)
+PLOT5_SIZE     <- c(width = 9, height = 6)
 
 # ------------------------------------------------------------------------------
 # Normalisation and input checks
@@ -229,8 +261,9 @@ print(as.data.frame(console_table), row.names = FALSE)
 # ------------------------------------------------------------------------------
 
 cat("\nSanity checks:\n")
-for (i in seq_len(nrow(metrics_summary) - 1L)) {
+for (i in seq_len(nrow(metrics_summary))) {
   row <- metrics_summary[i, ]
+  if (row$model == "majority_baseline") next
   if (row$macro_f1 <= baseline$macro_f1) {
     warning(sprintf(
       "%s / %s: macro F1 %.4f is at or below baseline %.4f",
@@ -255,14 +288,18 @@ for (nm in MODELS) {
 }
 
 # ------------------------------------------------------------------------------
-# Plot 4: row-normalised confusion matrices
-# AI-assisted (opencode), 2026-11-24
+# Best model (used by Plot 4 and findings)
 # ------------------------------------------------------------------------------
 
 model_metrics <- metrics_summary[metrics_summary$model != "majority_baseline", ]
 best <- model_metrics[which.max(model_metrics$macro_f1), ]
 best_model <- as.character(best$model)
 best_fs <- as.character(best$feature_set)
+
+# ------------------------------------------------------------------------------
+# Plot 4: row-normalised confusion matrices
+# AI-assisted (opencode), 2026-11-24
+# ------------------------------------------------------------------------------
 
 cm_best <- cm_all[cm_all$model == best_model & cm_all$feature_set == best_fs, ]
 cm_best$label_colour <- ifelse(cm_best$prop > 0.5, "white", "grey20")
@@ -276,27 +313,26 @@ p4 <- ggplot(cm_best, aes(x = predicted, y = actual, fill = prop)) +
     fill = NA, colour = "grey15", linewidth = 1.1, inherit.aes = FALSE
   ) +
   geom_text(aes(label = sprintf("%.2f", prop), colour = label_colour),
-            size = 4.2, fontface = "bold", vjust = -0.15) +
+            size = 3.2, fontface = "bold", vjust = -0.2) +
   geom_text(aes(label = paste0("n=", scales::comma(n)), colour = label_colour),
-            size = 3, vjust = 1.35, alpha = 0.9) +
+            size = 2.3, vjust = 1.4, alpha = 0.9) +
   scale_colour_identity() +
-  scale_fill_gradient(low = "white", high = "#08306B", limits = c(0, 1), name = "Proportion of actual class") +
+  scale_fill_gradient(low = "white", high = "#08306B", limits = c(0, 1), name = "Proportion of\nactual class") +
   labs(
     title = paste0("Confusion matrix: ", best_model, " / ", best_fs),
     subtitle = "Rows = actual emotion, normalised by actual class count",
     x = "Predicted emotion", y = "Actual emotion"
   ) +
-  theme_minimal(base_size = 12) +
+  theme_eda() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
-    axis.text.y = element_text(size = 11),
-    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
     panel.grid = element_blank(),
     legend.position = "right",
-    plot.background = element_rect(fill = "white", colour = NA)
+    legend.text = element_text(size = 7.5)
   )
 
-ggsave(file.path(OUT_DIR, "plot4_confusion.png"), p4, width = 8, height = 7, dpi = 300, bg = "white")
+ggsave(file.path(OUT_DIR, "plot4_confusion.png"), p4,
+       width = PLOT4_SIZE[["width"]], height = PLOT4_SIZE[["height"]], dpi = 300, bg = "white")
 
 # Plot 4b: best model across audio, lyrics, combined (1 x 3)
 cm_best_model <- cm_all[cm_all$model == best_model, ]
@@ -331,7 +367,7 @@ p4b <- ggplot(cm_best_model, aes(x = predicted, y = actual, fill = prop)) +
   )
 
 ggsave(file.path(OUT_DIR, "plot4b_confusion_by_featureset.png"), p4b,
-       width = 14, height = 5.5, dpi = 300, bg = "white")
+       width = PLOT4B_SIZE[["width"]], height = PLOT4B_SIZE[["height"]], dpi = 300, bg = "white")
 
 # Plot 4 (all): fixed 9-panel grid
 cm_all$label_colour <- ifelse(cm_all$prop > 0.5, "white", "grey20")
@@ -356,7 +392,7 @@ p4_all <- ggplot(cm_all, aes(x = predicted, y = actual, fill = prop)) +
   )
 
 ggsave(file.path(OUT_DIR, "plot4_confusion_all.png"), p4_all,
-       width = 16, height = 12, dpi = 300, bg = "white")
+       width = PLOT4_ALL_SIZE[["width"]], height = PLOT4_ALL_SIZE[["height"]], dpi = 300, bg = "white")
 
 cat("Plot 4 files:", file.path(OUT_DIR, "plot4_confusion.png"), "|",
     file.path(OUT_DIR, "plot4b_confusion_by_featureset.png"), "|",
@@ -383,23 +419,24 @@ cb_palette <- c(
   random_forest = "#5b6b86"
 )
 
-baseline_label <- sprintf("Majority-class baseline (macro F1 = %.3f)", baseline$macro_f1)
+baseline_label <- sprintf("Baseline\n(%.3f)", baseline$macro_f1)
 
 p5 <- ggplot(p5_data, aes(x = feature_set, y = macro_f1, fill = model)) +
   geom_col(position = position_dodge(width = 0.9), width = 0.75) +
   geom_text(
     aes(label = sprintf("%.3f", macro_f1)),
     position = position_dodge(width = 0.9),
-    vjust = -0.4, size = 4, colour = "#222222"
+    vjust = -0.4, size = 4.2, colour = "#222222"
   ) +
-  geom_hline(yintercept = baseline$macro_f1, linetype = "dashed", colour = "#8B0000", linewidth = 0.7) +
+  geom_hline(yintercept = baseline$macro_f1, linetype = "dashed", colour = "#444444", linewidth = 0.7) +
   annotate(
     "text",
-    x = 0.55, y = baseline$macro_f1,
+    x = Inf, y = baseline$macro_f1,
     label = baseline_label,
-    hjust = 0, vjust = -0.5,
-    colour = "#8B0000", size = 4
+    hjust = -0.08, lineheight = 0.9,
+    colour = "#444444", size = 4.2
   ) +
+  coord_cartesian(clip = "off") +
   scale_fill_manual(values = cb_palette, labels = model_labels, name = "Model") +
   scale_y_continuous(limits = c(0, 0.55), breaks = seq(0, 0.5, 0.1), expand = c(0, 0)) +
   labs(
@@ -408,34 +445,21 @@ p5 <- ggplot(p5_data, aes(x = feature_set, y = macro_f1, fill = model)) +
     x = "Feature set",
     y = "Macro F1"
   ) +
-  theme_minimal(base_size = 13) +
+  theme_eda() +
   theme(
-    plot.background = element_rect(fill = "white", colour = NA),
-    panel.background = element_rect(fill = "white", colour = NA),
-    axis.text = element_text(colour = "#222222", size = 12),
-    axis.title = element_text(colour = "#222222", size = 12),
-    strip.text = element_text(colour = "#222222", size = 12),
-    plot.title = element_text(colour = "#222222"),
-    plot.subtitle = element_text(colour = "#222222"),
-    panel.grid.major.y = element_line(colour = "grey90"),
-    panel.grid.minor = element_blank(),
     panel.grid.major.x = element_blank(),
-    panel.border = element_blank(),
     legend.position = "bottom",
-    legend.text = element_text(colour = "#222222", size = 12),
-    legend.title = element_text(colour = "#222222", size = 12)
+    plot.margin = margin(12, 85, 12, 12)
   )
 
-ggsave(file.path(OUT_DIR, "plot5_macro_f1.png"), p5, width = 9, height = 6, dpi = 300, bg = "white")
+ggsave(file.path(OUT_DIR, "plot5_macro_f1.png"), p5,
+       width = PLOT5_SIZE[["width"]], height = PLOT5_SIZE[["height"]], dpi = 300, bg = "white")
 cat("Plot 5 file:", file.path(OUT_DIR, "plot5_macro_f1.png"), "\n")
 cat("Baseline macro F1 used:", sprintf("%.3f", baseline$macro_f1), "\n")
 
 # ------------------------------------------------------------------------------
 # Final findings
 # ------------------------------------------------------------------------------
-
-model_metrics <- metrics_summary[metrics_summary$model != "majority_baseline", ]
-best <- model_metrics[which.max(model_metrics$macro_f1), ]
 
 cat("\n======================================================================\n")
 cat("FINDINGS\n")

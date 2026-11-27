@@ -43,7 +43,7 @@ MODEL_CFG <- list(
 
 SPARK_VERSION <- "3.5.1"
 DATA_DIR <- file.path("data", "processed")
-OUT_DIR <- "output"
+OUT_DIR <- "outputs"
 FILE_MAP <- c(audio = "audio", lyric = "lyrics", combined = "combined")
 OUTPUT_LABEL <- c(audio = "audio", lyric = "lyrics", combined = "combined")
 ALL_SETS <- unname(OUTPUT_LABEL)
@@ -83,19 +83,35 @@ check_existing_weights <- function(train_sdf, expected) {
 # ------------------------------------------------------------------------------
 
 Sys.setenv(SPARK_LOCAL_IP = "127.0.0.1")
-hadoop_home <- file.path(
-  spark_install_dir(),
-  paste0("spark-", SPARK_VERSION, "-bin-hadoop3"), "tmp", "hadoop"
-)
-if (dir.exists(hadoop_home)) {
-  Sys.setenv(HADOOP_HOME = hadoop_home)
-  Sys.setenv(PATH = paste(file.path(hadoop_home, "bin"), Sys.getenv("PATH"), sep = ";"))
-  java_opts <- paste0(
-    "-Dhadoop.home.dir=", hadoop_home,
-    " -Djava.library.path=", file.path(hadoop_home, "bin")
-  )
-} else {
-  java_opts <- ""
+java_opts <- ""
+hadoop_home <- ""
+if (.Platform$OS.type == "windows") {
+  candidates <- unique(c(
+    Sys.getenv("HADOOP_HOME", unset = ""),
+    file.path(spark_install_dir(),
+              paste0("spark-", SPARK_VERSION, "-bin-hadoop3"), "tmp", "hadoop"),
+    "C:/hadoop"
+  ))
+  candidates <- candidates[nzchar(candidates)]
+  for (cand in candidates) {
+    if (file.exists(file.path(cand, "bin", "winutils.exe"))) {
+      hadoop_home <- normalizePath(cand, winslash = "/", mustWork = FALSE)
+      break
+    }
+  }
+  if (nzchar(hadoop_home)) {
+    Sys.setenv(HADOOP_HOME = hadoop_home)
+    Sys.setenv(PATH = paste(normalizePath(file.path(hadoop_home, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
+    java_opts <- paste0(
+      "-Dhadoop.home.dir=", hadoop_home,
+      " -Djava.library.path=", file.path(hadoop_home, "bin")
+    )
+  } else {
+    warning(
+      "Windows Hadoop native files not found. If Spark fails, install winutils.exe in C:/hadoop/bin or set HADOOP_HOME.",
+      call. = FALSE
+    )
+  }
 }
 
 sc <- spark_connect(
