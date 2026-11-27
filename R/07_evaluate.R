@@ -378,9 +378,9 @@ model_labels <- c(
   random_forest = "Random Forest"
 )
 cb_palette <- c(
-  naive_bayes = "#0072B2",
-  logistic_regression = "#E69F00",
-  random_forest = "#009E73"
+  naive_bayes = "#8d99b0",
+  logistic_regression = "#2c3e50",
+  random_forest = "#5b6b86"
 )
 
 baseline_label <- sprintf("Majority-class baseline (macro F1 = %.3f)", baseline$macro_f1)
@@ -469,4 +469,3 @@ for (i in seq_len(nrow(weak))) {
 }
 cat("\nBaseline used:", baseline$class, "| macro F1 =", round(baseline$macro_f1, 4),
     "| accuracy =", round(baseline$accuracy, 4), "\n")
-
