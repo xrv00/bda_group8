@@ -139,45 +139,23 @@ read_train_labels <- function(path = file.path("data", "processed", "audio_train
   if (!requireNamespace("sparklyr", quietly = TRUE)) stop("package `sparklyr` is required")
 
   Sys.setenv(SPARK_LOCAL_IP = "127.0.0.1")
-  java_opts <- ""
-  hadoop_home <- ""
+  # Windows: point Spark to the Hadoop files if they exist
   if (.Platform$OS.type == "windows") {
-    candidates <- unique(c(
-      Sys.getenv("HADOOP_HOME", unset = ""),
-      file.path(sparklyr::spark_install_dir(),
-                paste0("spark-", spark_version, "-bin-hadoop3"), "tmp", "hadoop"),
-      "C:/hadoop"
-    ))
-    candidates <- candidates[nzchar(candidates)]
-    for (cand in candidates) {
-      if (file.exists(file.path(cand, "bin", "winutils.exe"))) {
-        hadoop_home <- normalizePath(cand, winslash = "/", mustWork = FALSE)
-        break
-      }
-    }
-    if (nzchar(hadoop_home)) {
-      Sys.setenv(HADOOP_HOME = hadoop_home)
-      Sys.setenv(PATH = paste(normalizePath(file.path(hadoop_home, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
-      java_opts <- paste0(
-        "-Dhadoop.home.dir=", hadoop_home,
-        " -Djava.library.path=", file.path(hadoop_home, "bin")
-      )
-    } else {
-      warning(
-        "Windows Hadoop native files not found. If Spark fails, install winutils.exe in C:/hadoop/bin or set HADOOP_HOME.",
-        call. = FALSE
-      )
-    }
+    hh <- Sys.getenv("HADOOP_HOME")
+    if (hh == "" && dir.exists("C:/hadoop/bin")) { hh <- "C:/hadoop"; Sys.setenv(HADOOP_HOME = hh) }
+    if (hh != "") Sys.setenv(PATH = paste(normalizePath(file.path(hh, "bin"), winslash = "\\"), Sys.getenv("PATH"), sep = ";"))
   }
-
+  if (.Platform$OS.type == "windows") {
+    hh_chk <- Sys.getenv("HADOOP_HOME")
+    if (!nzchar(hh_chk) || !file.exists(file.path(hh_chk, "bin", "hadoop.dll")))
+      warning("hadoop.dll not found in HADOOP_HOME/bin. Spark may fail on Windows.", call. = FALSE)
+  }
   sc <- sparklyr::spark_connect(
     master = "local",
     version = spark_version,
     config = list(
       spark.sql.shuffle.partitions = "8",
-      spark.ui.enabled = "false",
-      `spark.driver.extraJavaOptions` = java_opts,
-      `spark.executor.extraJavaOptions` = java_opts
+      spark.ui.enabled = "false"
     )
   )
   on.exit(sparklyr::spark_disconnect(sc), add = TRUE)

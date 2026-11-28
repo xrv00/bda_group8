@@ -80,7 +80,7 @@ MODEL_FILES <- c(
 PLOT4_SIZE     <- c(width = 6.2, height = 5.4)
 PLOT4B_SIZE    <- c(width = 14, height = 5.5)
 PLOT4_ALL_SIZE <- c(width = 16, height = 12)
-PLOT5_SIZE     <- c(width = 9, height = 6)
+PLOT5_SIZE     <- c(width = 9, height = 11.5)
 
 # ------------------------------------------------------------------------------
 # Normalisation and input checks
