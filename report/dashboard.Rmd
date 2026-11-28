@@ -1,0 +1,119 @@
+---
+pagetitle: "Predicting Lyrical Emotion in Songs | Group 8"
+output:
+  html_document:
+    theme: flatly
+    self_contained: true
+knit: (function(input, ...) rmarkdown::render(input, output_file = "final_dashboard.html", envir = globalenv()))
+---
+
+```{r setup, include = FALSE}
+# AI-assisted (Claude), 2026-11-27
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Plots are read from outputs/ (one level up from report/)
+plot_dir <- file.path("..", "outputs")
+
+# One dashboard tile: the plot (click to enlarge) with a one-line caption under it.
+# If the plot is missing, the tile says which script makes it instead of crashing.
+tile <- function(file, script, area, caption) {
+  path <- file.path(plot_dir, file)
+  body <- if (file.exists(path)) {
+    sprintf('<img src="%s" alt="%s" onclick="zoom(this)">', knitr::image_uri(path), file)
+  } else {
+    sprintf('<div class="missing">Plot not available yet.<br>Run %s to create outputs/%s</div>', script, file)
+  }
+  sprintf('<div class="tile %s">%s<div class="cap">%s</div></div>', area, body, caption)
+}
+```
+
+```{css}
+/* Page: 1366-1920 px wide, light grey background */
+body { min-width: 1366px; background: #eceff3; }
+/* Font: Segoe UI on Windows; Arial on computers without it */
+body, h1, .kpi, .cap, .foot { font-family: "Segoe UI", Arial, sans-serif; }
+.main-container { max-width: 1920px; padding: 10px 22px; margin: 0 auto; }
+
+/* One screen: title, KPI row, plots, footer */
+.dash { height: calc(100vh - 20px); display: grid; gap: 10px;
+        grid-template-rows: auto auto minmax(0, 1fr) auto; }
+
+/* Title: navy band across the full width of the top */
+.head { background: #2c3e50; margin: -10px -22px 0; padding: 12px 22px; }
+.head h1 { font-size: 30px; font-weight: 700; margin: 0; display: inline; color: #fff; }
+.head span { font-size: 14px; color: #d5dbe3; margin-left: 12px; }
+
+/* KPI boxes: 4 in a row, big number on top, label under it, soft shadow */
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.kpi { text-align: center; background: #fff; border: 1px solid #e3e3e3; border-radius: 2px; padding: 6px 14px; box-shadow: 0 2px 6px rgba(0,0,0,.16); }
+.kpi:last-child { border: 2px solid #2c3e50; box-shadow: 0 4px 12px rgba(0,0,0,.22); }   /* best-model KPI: navy outline, lifted higher */
+.kpi .num { font-size: 28px; font-weight: 700; color: #2c3e50; line-height: 1.2; }
+.kpi .lab { font-size: 12px; color: #6b6b6b; }
+
+/* Plot layout: Plot 5 tall in the centre, 1 and 2 on the left, 4 and 6 on the right */
+.story { display: grid; gap: 10px; min-height: 0;
+         grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr;
+         grid-template-areas: "p1 p5 p4" "p2 p5 p6"; }
+.p1 { grid-area: p1; } .p2 { grid-area: p2; } .p4 { grid-area: p4; } .p5 { grid-area: p5; } .p6 { grid-area: p6; }
+
+/* One plot box: plot on top, caption strip under it, light shadow */
+.tile { background: #fff; border: 1px solid #e3e3e3; border-radius: 2px; padding: 6px 8px; box-shadow: 0 1px 3px rgba(0,0,0,.10);
+        display: flex; flex-direction: column; min-height: 0; }
+.p5 { box-shadow: 0 4px 12px rgba(0,0,0,.22); }   /* Plot 5 (main result) lifted higher, same depth as the best-model KPI */
+.tile img { flex: 1; min-height: 0; width: 100%; object-fit: contain; cursor: zoom-in; }
+.missing { flex: 1; display: flex; align-items: center; justify-content: center; text-align: center;
+           border: 1px dashed #b0b0b0; color: #888; font-size: 13px; }
+
+/* Caption: bold text on a light grey strip at the bottom of each plot box */
+.cap { font-size: 13px; font-weight: 700; color: #1f2d3a; text-align: center; line-height: 1.3; background: #f1f2f4; border-top: 1px solid #e1e4e8;
+       margin: 6px -8px -6px; padding: 6px 10px; border-radius: 0 0 2px 2px; }
+.foot { font-size: 11px; color: #8a8f98; }
+
+/* Click to enlarge: dark overlay with the plot in the middle */
+#lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.8); z-index: 9999;
+            align-items: center; justify-content: center; cursor: zoom-out; }
+#lightbox img { max-width: 95vw; max-height: 95vh; background: #fff; }
+```
+
+<div class="dash">
+
+<div class="head"><h1>Predicting Lyrical Emotion in Songs</h1><span>Audio vs lyrics vs combined features with Spark MLlib &nbsp;|&nbsp; KD44103 Big Data Analytics, Group 8</span></div>
+
+<div class="kpis">
+<div class="kpi"><div class="num">492,943</div><div class="lab">songs after cleaning</div></div>
+<div class="kpi"><div class="num">98,950</div><div class="lab">test songs (split by artist)</div></div>
+<div class="kpi"><div class="num">4.9&times;</div><div class="lab">better than the baseline (always picking joy)</div></div>
+<div class="kpi"><div class="num">0.454</div><div class="lab">best Macro F1 (logistic regression, combined)</div></div>
+</div>
+
+```{r, results = "asis"}
+cat('<div class="story">',
+    tile("plot1_emotion_distribution.png", "R/03_eda.R", "p1",
+         "Accuracy would hide poor results on rare emotions, so Macro F1 is used."),
+    tile("plot5_macro_f1.png", "R/07_evaluate.R", "p5",
+         "Lyrics beat audio for every model. Adding audio to lyrics gains only 0.01."),
+    tile("plot2_valence_by_emotion.png", "R/03_eda.R", "p2",
+         "Valence overlaps across emotions, which suggests audio alone will struggle."),
+    tile("plot4_confusion.png", "R/07_evaluate.R", "p4",
+         "The best model finds 51–61% of each emotion, but most of its surprise guesses are wrong."),
+    tile("plot6_similarity_by_emotion.png", "R/03_eda.R", "p6",
+         "Similarity can help spot surprise songs, but not the other five emotions."),
+    '</div>')
+```
+
+<div class="foot"><b>Note:</b> Labels were generated from the lyrics by the model mrm8488/t5-base-finetuned-emotion, so models that use lyrics start with an advantage. Data: Kaggle, "500K+ Spotify Songs with Lyrics, Emotions & More". Click any plot to enlarge.</div>
+
+</div>
+
+<div id="lightbox" onclick="this.style.display='none'"><img id="lightbox-img" alt="enlarged plot"></div>
+
+<script>
+// Show a clicked plot full screen; click again or press Esc to close
+function zoom(img) {
+  document.getElementById("lightbox-img").src = img.src;
+  document.getElementById("lightbox").style.display = "flex";
+}
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape") document.getElementById("lightbox").style.display = "none";
+});
+</script>
