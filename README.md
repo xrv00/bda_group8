@@ -26,10 +26,10 @@ This project predicts the emotion of a song using audio features, lyrics, and bo
 | R/04_model_naive_bayes.R | Naive Bayes on the 3 feature sets |
 | R/05_model_logistic.R | Logistic regression on the 3 feature sets |
 | R/06_model_random_forest.R | Random forest on the 3 feature sets |
-| R/07_evaluate.R | Metrics, majority-class baseline, plots 4 and 5 |
+| R/07_evaluate.R | Metrics, majority-class baseline, confusion-matrix plots, macro-F1 plot |
 | R/eval_utils.R | Shared evaluation functions (macro F1, confusion matrix) |
 | sql/ | SQL queries and views |
-| outputs/ | Predictions (CSV) and plots (PNG) |
+| outputs/ | Predictions (CSV), metrics (CSV), and plots (PNG) |
 | report/ | Dashboard and report files |
 | data/ | Local data folders (not stored on GitHub) |
 
@@ -49,6 +49,7 @@ Alternatively, if you use Git: `git clone https://github.com/xrv00/bda_group8.gi
 - R (4.1 or newer) and RStudio
 - Java (needed by Spark)
 - R packages: tidyverse, sparklyr, DBI, RSQLite, ggplot2, rmarkdown
+- **Windows only (Spark/Hadoop):** place `winutils.exe` and `hadoop.dll` in `C:\hadoop\bin`, or set `HADOOP_HOME` to a folder whose `bin\` contains both files. Both files are required; incomplete setups can cause confusing Spark/Hadoop native-library errors.
   
 ## Data
 **Raw data (Kaggle):**
@@ -75,7 +76,7 @@ If you run the scripts from the start, you do not need the Drive files, because 
 | predictions_logistic_regression.csv | outputs/ | Data Scientist |
 | predictions_random_forest.csv | outputs/ | Integration Lead |
 | plot1 to plot3, plot6 | outputs/ | Data Scientist |
-| plot4_confusion.png, plot5_macro_f1.png | outputs/ | Integration Lead |
+| plot4_confusion.png, plot4b_confusion_by_featureset.png, plot4_confusion_all.png, plot5_macro_f1.png | outputs/ | Integration Lead |
 | dashboard.Rmd, final_dashboard.html | report/ | Data Scientist |
 
 ## How to Run
@@ -87,7 +88,7 @@ Run from the project root, in this order:
 5. `R/05_model_logistic.R`
 6. `R/06_model_random_forest.R`
 7. `R/07_evaluate.R`
-8. Knit `report/dashboard.Rmd` to produce `dashboard.html`
+8. Knit `report/dashboard.Rmd` to produce `final_dashboard.html`
 
 ## AI Usage
 AI-assisted code is marked with `# AI-assisted` comments in the scripts.
